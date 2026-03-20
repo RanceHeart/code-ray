@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-ray"
+version = "0.1.0"
+description = "Precompute a file-level dependency graph and serve token-efficient code context packs for AI agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "qili"}]
+keywords = ["code-analysis", "dependency-graph", "ai", "context", "cli"]
+
+[project.scripts]
+coderay = "coderay.cli:main"
+
+[tool.setuptools]
+packages = ["coderay"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+coderay = []

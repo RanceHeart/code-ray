@@ -1,0 +1,2 @@
+[console_scripts]
+coderay = coderay.cli:main
