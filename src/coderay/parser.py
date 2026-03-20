@@ -93,6 +93,12 @@ class TreeSitterParser:
                     lang = Language(capsule)
                     parser = Parser(lang)
                     self._parsers[our_lang] = parser
+                elif our_lang == "java":
+                    from tree_sitter_java import language as java_lang
+                    capsule = java_lang()
+                    lang = Language(capsule)
+                    parser = Parser(lang)
+                    self._parsers[our_lang] = parser
                 else:
                     # Standard pattern: tree_sitter_<lang>
                     module_name = f"tree_sitter_{ts_name}"

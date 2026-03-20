@@ -21,6 +21,8 @@ JS_IMPORT_FROM = re.compile(
 JS_REQUIRE = re.compile(r"\brequire\s*\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)", re.MULTILINE)
 JS_DYNAMIC_IMPORT = re.compile(r"\bimport\s*\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)", re.MULTILINE)
 
+SWIFT_IMPORT = re.compile(r"^\s*(?:import|@import)\s+(?P<module>[\w]+)", re.MULTILINE)
+
 # Tree-sitter parser instance (lazy init)
 _TS_PARSER: Optional[TreeSitterParser] = None
 
@@ -162,6 +164,18 @@ def _parse_js_imports(text: str) -> List[str]:
     return out
 
 
+def _parse_swift_imports(text: str) -> List[str]:
+    """Parse Swift import statements: `import Foo` and `@import Foo`."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for m in SWIFT_IMPORT.finditer(text):
+        mod = m.group("module")
+        if mod and mod not in seen:
+            seen.add(mod)
+            out.append(mod)
+    return out
+
+
 def _resolve_java_import(project_root: str, src_abs: str, ref: str, known: Set[str]) -> Optional[str]:
     """Resolve a Java import to a file path if it's a local file."""
     # Java imports are like "com.example.MyClass" or just "MyClass"
@@ -174,17 +188,29 @@ def _resolve_java_import(project_root: str, src_abs: str, ref: str, known: Set[s
     return None
 
 
-def _resolve_swift_import(project_root: str, src_abs: str, ref: str, known: Set[str]) -> Optional[str]:
-    """Resolve a Swift import to a file path if it's a local file."""
-    # Swift imports are module names (files don't need extension)
-    # Look for matching .swift files
-    if os.path.isfile(os.path.join(project_root, ref + ".swift")):
-        return _rel(project_root, os.path.join(project_root, ref + ".swift"))
-    # Also check in subdirectories
-    for root, _, files in os.walk(project_root):
-        if ref + ".swift" in files:
-            return _rel(project_root, os.path.join(root, ref + ".swift"))
-    return None
+def _build_swift_module_map(known: Set[str]) -> Dict[str, str]:
+    """Build a fast basename → path lookup for Swift module resolution."""
+    mod_map: Dict[str, List[str]] = {}
+    for p in known:
+        if p.endswith(".swift"):
+            basename = os.path.splitext(os.path.basename(p))[0]
+            mod_map.setdefault(basename, []).append(p)
+    # Prefer shorter paths (more likely to be a direct module root)
+    return {k: sorted(vs, key=lambda p: p.count("/"))[0] for k, vs in mod_map.items()}
+
+
+def _resolve_swift_import(
+    project_root: str, ref: str, known: Set[str], module_map: Dict[str, str]
+) -> Tuple[Optional[str], bool]:
+    """Resolve a Swift import module name to a local file path via known set.
+
+    Returns (resolved_path, is_external).
+    - is_external=True means it's likely a pod/framework, not a local file.
+    """
+    # Fast path: check pre-built module map
+    if ref in module_map:
+        return module_map[ref], False
+    return None, True
 
 
 def build_index(project_root: str, files: List[FileInfo]) -> dict:
@@ -194,13 +220,17 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
     abs_by_rel: Dict[str, str] = {fi.path: os.path.join(project_root, fi.path) for fi in files}
     known: Set[str] = set(abs_by_rel.keys())
 
+    # Assign an integer ID to each file path for compact edge references
+    path_to_id: Dict[str, int] = {}
+    for i, fi in enumerate(files):
+        path_to_id[fi.path] = i
+
     nodes = [
         {
+            "id": path_to_id[fi.path],
             "path": fi.path,
             "lang": fi.lang,
-            "size": fi.size,
             "lines": fi.lines,
-            "dir": os.path.dirname(fi.path),
         }
         for fi in files
     ]
@@ -208,6 +238,9 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
     edges_set: Set[Tuple[str, str]] = set()
     external: Set[str] = set()
     structure: Dict[str, dict] = {}  # path -> {imports, funcs, calls, classes}
+
+    # Pre-build Swift module map for fast import resolution
+    swift_module_map: Dict[str, str] = _build_swift_module_map(known)
 
     # Use tree-sitter if available for supported languages
     ts_parser = _get_ts_parser() if TS_AVAILABLE else None
@@ -250,8 +283,7 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
                         resolved = _resolve_java_import(project_root, src_abs, ref, known)
                         is_ext = resolved is None
                     elif fi.lang == "swift":
-                        resolved = _resolve_swift_import(project_root, src_abs, ref, known)
-                        is_ext = resolved is None
+                        resolved, is_ext = _resolve_swift_import(project_root, ref, known, swift_module_map)
 
                     if resolved and resolved in known:
                         edges_set.add((src_rel, resolved))
@@ -273,6 +305,13 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
                     edges_set.add((src_rel, resolved))
                 elif is_ext:
                     external.add(ref.lstrip(".").split(".")[0])
+        elif fi.lang == "swift":
+            for ref in _parse_swift_imports(text):
+                resolved, is_ext = _resolve_swift_import(project_root, ref, known, swift_module_map)
+                if resolved and resolved in known:
+                    edges_set.add((src_rel, resolved))
+                elif is_ext:
+                    external.add(ref)
         else:
             for ref in _parse_js_imports(text):
                 resolved: Optional[str] = None
@@ -288,7 +327,7 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
                     if pkg and not ref.startswith("@/"):
                         external.add(pkg)
 
-    edges = [{"src": s, "tgt": t} for (s, t) in sorted(edges_set)]
+    edges = [{"src": path_to_id[s], "tgt": path_to_id[t]} for (s, t) in sorted(edges_set)]
 
     out_adj: Dict[str, List[str]] = {}
     in_adj: Dict[str, List[str]] = {}
