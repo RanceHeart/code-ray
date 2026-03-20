@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .project_hints import load_project_hints
 from .scanner import FileInfo
+from .parser import TreeSitterParser, TS_AVAILABLE, ParsedFile
 
 PY_IMPORT = re.compile(
     r"^\s*(?:import\s+(?P<plain>[\w][\w.]*)|from\s+(?P<from>\.*[\w][\w.]*|\.+)\s+import\s+.+)",
@@ -19,6 +20,15 @@ JS_IMPORT_FROM = re.compile(
 )
 JS_REQUIRE = re.compile(r"\brequire\s*\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)", re.MULTILINE)
 JS_DYNAMIC_IMPORT = re.compile(r"\bimport\s*\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)", re.MULTILINE)
+
+# Tree-sitter parser instance (lazy init)
+_TS_PARSER: Optional[TreeSitterParser] = None
+
+def _get_ts_parser() -> TreeSitterParser:
+    global _TS_PARSER
+    if _TS_PARSER is None:
+        _TS_PARSER = TreeSitterParser()
+    return _TS_PARSER
 
 
 def _to_posix(p: str) -> str:
@@ -152,6 +162,31 @@ def _parse_js_imports(text: str) -> List[str]:
     return out
 
 
+def _resolve_java_import(project_root: str, src_abs: str, ref: str, known: Set[str]) -> Optional[str]:
+    """Resolve a Java import to a file path if it's a local file."""
+    # Java imports are like "com.example.MyClass" or just "MyClass"
+    # We look for matching .java files in the project
+    # Simple heuristic: convert package to path and look for .java file
+    parts = ref.split(".")
+    base = os.path.join(project_root, *parts)
+    if os.path.isfile(base + ".java"):
+        return _rel(project_root, base + ".java")
+    return None
+
+
+def _resolve_swift_import(project_root: str, src_abs: str, ref: str, known: Set[str]) -> Optional[str]:
+    """Resolve a Swift import to a file path if it's a local file."""
+    # Swift imports are module names (files don't need extension)
+    # Look for matching .swift files
+    if os.path.isfile(os.path.join(project_root, ref + ".swift")):
+        return _rel(project_root, os.path.join(project_root, ref + ".swift"))
+    # Also check in subdirectories
+    for root, _, files in os.walk(project_root):
+        if ref + ".swift" in files:
+            return _rel(project_root, os.path.join(root, ref + ".swift"))
+    return None
+
+
 def build_index(project_root: str, files: List[FileInfo]) -> dict:
     project_root = os.path.abspath(project_root)
     hints = load_project_hints(project_root)
@@ -172,13 +207,61 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
 
     edges_set: Set[Tuple[str, str]] = set()
     external: Set[str] = set()
+    structure: Dict[str, dict] = {}  # path -> {imports, funcs, calls, classes}
+
+    # Use tree-sitter if available for supported languages
+    ts_parser = _get_ts_parser() if TS_AVAILABLE else None
 
     for fi in files:
-        if fi.lang not in {"python", "javascript", "typescript"}:
+        if fi.lang not in {"python", "javascript", "typescript", "java", "swift"}:
             continue
 
         src_rel = fi.path
         src_abs = abs_by_rel[src_rel]
+
+        if ts_parser:
+            # Try tree-sitter parsing first
+            parsed: ParsedFile = ts_parser.parse(src_abs, fi.lang)
+            if parsed.imports or parsed.func_defs or parsed.func_calls or parsed.classes:
+                # Store structure info
+                structure[src_rel] = {
+                    "imports": [imp.path for imp in parsed.imports],
+                    "funcs": [(f.name, f.kind, f.receiver) for f in parsed.func_defs],
+                    "calls": [(c.name, c.recv) for c in parsed.func_calls],
+                    "classes": parsed.classes,
+                }
+
+                # Resolve imports to edges
+                for imp in parsed.imports:
+                    ref = imp.path
+                    if not ref:
+                        continue
+                    resolved: Optional[str] = None
+                    is_ext = False
+
+                    if fi.lang == "python":
+                        resolved, is_ext = _resolve_py_module(project_root, src_abs, ref)
+                    elif fi.lang in ("javascript", "typescript"):
+                        if ref.startswith("./") or ref.startswith("../"):
+                            resolved = _resolve_js_relative(project_root, src_abs, ref)
+                        else:
+                            resolved = _resolve_ts_alias(project_root, ref, hints)
+                    elif fi.lang == "java":
+                        resolved = _resolve_java_import(project_root, src_abs, ref, known)
+                        is_ext = resolved is None
+                    elif fi.lang == "swift":
+                        resolved = _resolve_swift_import(project_root, src_abs, ref, known)
+                        is_ext = resolved is None
+
+                    if resolved and resolved in known:
+                        edges_set.add((src_rel, resolved))
+                    elif is_ext:
+                        pkg = ref.split("/")[0] if not ref.startswith("@") else "/".join(ref.split("/")[:2])
+                        if pkg:
+                            external.add(pkg)
+                continue
+
+        # Fallback to regex parsing for backward compatibility
         text = _read_text(src_abs)
         if not text:
             continue
@@ -236,6 +319,7 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
         "edges": edges,
         "adj": {"out": out_adj, "in": in_adj},
         "external_deps": sorted(x for x in external if x),
+        "structure": structure,  # AI-relevant: funcs, calls, classes per file
     }
 
 

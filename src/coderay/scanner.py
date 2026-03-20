@@ -15,6 +15,8 @@ LANG_MAP: Dict[str, str] = {
     ".ts": "typescript",
     ".tsx": "typescript",
     ".mts": "typescript",
+    ".java": "java",
+    ".swift": "swift",
     ".json": "json",
     ".toml": "toml",
     ".yml": "yaml",
