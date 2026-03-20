@@ -176,16 +176,42 @@ def _parse_swift_imports(text: str) -> List[str]:
     return out
 
 
-def _resolve_java_import(project_root: str, src_abs: str, ref: str, known: Set[str]) -> Optional[str]:
-    """Resolve a Java import to a file path if it's a local file."""
-    # Java imports are like "com.example.MyClass" or just "MyClass"
-    # We look for matching .java files in the project
-    # Simple heuristic: convert package to path and look for .java file
-    parts = ref.split(".")
-    base = os.path.join(project_root, *parts)
-    if os.path.isfile(base + ".java"):
-        return _rel(project_root, base + ".java")
-    return None
+def _resolve_java_import(
+    project_root: str,
+    src_abs: str,
+    ref: str,
+    known: Set[str],
+    java_pkg_map: Dict[str, str],
+) -> Tuple[Optional[str], bool]:
+    """Resolve a Java import to a local file via java_pkg_map (O(1)).
+
+    Returns (resolved_rel_path, is_external).
+    """
+    # 1. Relative import: ".Foo" from "com.douban.frodo.foo" -> "com.douban.frodo.foo.Foo"
+    if ref.startswith("."):
+        src_pkg = None
+        try:
+            with open(src_abs, "r", encoding="utf-8", errors="replace") as f:
+                header = f.read(500)
+            m = _PKG_LINE_RE.search(header)
+            if m:
+                src_pkg = m.group(1)
+        except OSError:
+            pass
+        if src_pkg:
+            full_pkg = src_pkg + ref
+            if full_pkg in java_pkg_map:
+                return java_pkg_map[full_pkg], False
+            alt = src_pkg + "." + ref.lstrip(".")
+            if alt in java_pkg_map:
+                return java_pkg_map[alt], False
+
+    # 2. Absolute import: look up in pkg map
+    if ref in java_pkg_map:
+        return java_pkg_map[ref], False
+
+    # 3. No match -> external (third-party or JDK)
+    return None, True
 
 
 def _build_swift_module_map(known: Set[str]) -> Dict[str, str]:
@@ -197,6 +223,37 @@ def _build_swift_module_map(known: Set[str]) -> Dict[str, str]:
             mod_map.setdefault(basename, []).append(p)
     # Prefer shorter paths (more likely to be a direct module root)
     return {k: sorted(vs, key=lambda p: p.count("/"))[0] for k, vs in mod_map.items()}
+
+
+_PKG_LINE_RE = re.compile(r"^\s*package\s+([\w.]+);", re.MULTILINE)
+
+
+def _build_java_pkg_map(files: List[FileInfo], abs_by_rel: Dict[str, str]) -> Dict[str, str]:
+    """Build a fast fully-qualified-package → file path map for Java.
+
+    Reads only the first 500 chars of each .java file to extract its package decl.
+    Builds a map: "com.douban.frodo.RexxarWidget" → "app/.../RexxarWidget.java"
+    """
+    pkg_map: Dict[str, str] = {}
+    for fi in files:
+        if fi.lang != "java":
+            continue
+        abs_path = abs_by_rel.get(fi.path)
+        if not abs_path:
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                header = f.read(500)
+            m = _PKG_LINE_RE.search(header)
+            if m:
+                pkg = m.group(1)
+                # e.g. "com.douban.frodo.rexxar.RexxarWidget" → ".../RexxarWidget.java"
+                class_name = pkg.rsplit(".", 1)[-1]
+                if fi.path.endswith(f"/{class_name}.java") or fi.path.endswith(f"\\{class_name}.java"):
+                    pkg_map[pkg] = fi.path
+        except OSError:
+            continue
+    return pkg_map
 
 
 def _resolve_swift_import(
@@ -242,6 +299,9 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
     # Pre-build Swift module map for fast import resolution
     swift_module_map: Dict[str, str] = _build_swift_module_map(known)
 
+    # Pre-build Java package map for fast import resolution
+    java_pkg_map: Dict[str, str] = _build_java_pkg_map(files, abs_by_rel)
+
     # Use tree-sitter if available for supported languages
     ts_parser = _get_ts_parser() if TS_AVAILABLE else None
 
@@ -280,7 +340,7 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
                         else:
                             resolved = _resolve_ts_alias(project_root, ref, hints)
                     elif fi.lang == "java":
-                        resolved = _resolve_java_import(project_root, src_abs, ref, known)
+                        resolved = _resolve_java_import(project_root, src_abs, ref, known, java_pkg_map)
                         is_ext = resolved is None
                     elif fi.lang == "swift":
                         resolved, is_ext = _resolve_swift_import(project_root, ref, known, swift_module_map)

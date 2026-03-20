@@ -62,7 +62,7 @@ def find_symbol(index: dict, name: str, top_n: int = 20) -> dict:
     for n in nodes:
         path = n.get("path") or ""
         lang = n.get("lang") or _lang_from_path(path)
-        if lang not in {"python", "javascript", "typescript", "swift"}:
+        if lang not in {"python", "javascript", "typescript", "swift", "java"}:
             continue
 
         text = _read_text(os.path.join(root, path))
