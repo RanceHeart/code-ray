@@ -22,6 +22,7 @@ JS_REQUIRE = re.compile(r"\brequire\s*\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)", re
 JS_DYNAMIC_IMPORT = re.compile(r"\bimport\s*\(\s*['\"](?P<path>[^'\"]+)['\"]\s*\)", re.MULTILINE)
 
 SWIFT_IMPORT = re.compile(r"^\s*(?:import|@import)\s+(?P<module>[\w]+)", re.MULTILINE)
+JAVA_IMPORT_RE = re.compile(r"^\s*import\s+(?P<pkg>[\w.]+);", re.MULTILINE)
 
 # Tree-sitter parser instance (lazy init)
 _TS_PARSER: Optional[TreeSitterParser] = None
@@ -232,9 +233,21 @@ def _build_java_pkg_map(files: List[FileInfo], abs_by_rel: Dict[str, str]) -> Di
     """Build a fast fully-qualified-package → file path map for Java.
 
     Reads only the first 500 chars of each .java file to extract its package decl.
-    Builds a map: "com.douban.frodo.RexxarWidget" → "app/.../RexxarWidget.java"
+    Handles Android project path conventions where files live under e.g.
+    "app/src/main/java/com/douban/frodo/rexxar/" but package is "com.douban.frodo.rexxar".
     """
     pkg_map: Dict[str, str] = {}
+
+    # Strip common Android/Java source path prefixes
+    SOURCE_PREFIXES = (
+        "app/src/main/java/",
+        "app/src/test/java/",
+        "app/src/androidTest/java/",
+        "src/main/java/",
+        "src/test/java/",
+        "src/androidTest/java/",
+    )
+
     for fi in files:
         if fi.lang != "java":
             continue
@@ -245,15 +258,28 @@ def _build_java_pkg_map(files: List[FileInfo], abs_by_rel: Dict[str, str]) -> Di
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 header = f.read(500)
             m = _PKG_LINE_RE.search(header)
-            if m:
-                pkg = m.group(1)
-                # e.g. "com.douban.frodo.rexxar.RexxarWidget" → ".../RexxarWidget.java"
-                class_name = pkg.rsplit(".", 1)[-1]
-                if fi.path.endswith(f"/{class_name}.java") or fi.path.endswith(f"\\{class_name}.java"):
-                    pkg_map[pkg] = fi.path
+            if not m:
+                continue
+            pkg = m.group(1)
+            # Strip Android source prefix to get relative-to-source-root path
+            rel = fi.path
+            for prefix in SOURCE_PREFIXES:
+                if rel.startswith(prefix):
+                    rel = rel[len(prefix):]
+                    break
+            # Build FQCN: "com.douban.frodo.rexxar.toolbox.RexxarRemoteService"
+            fname = rel.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if fname.endswith(".java"):
+                class_name = fname[:-5]
+                if class_name:
+                    fqcn = f"{pkg}.{class_name}"
+                    if fqcn not in pkg_map:
+                        pkg_map[fqcn] = fi.path
         except OSError:
             continue
     return pkg_map
+
+
 
 
 def _resolve_swift_import(
@@ -340,8 +366,7 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
                         else:
                             resolved = _resolve_ts_alias(project_root, ref, hints)
                     elif fi.lang == "java":
-                        resolved = _resolve_java_import(project_root, src_abs, ref, known, java_pkg_map)
-                        is_ext = resolved is None
+                        resolved, is_ext = _resolve_java_import(project_root, src_abs, ref, known, java_pkg_map)
                     elif fi.lang == "swift":
                         resolved, is_ext = _resolve_swift_import(project_root, ref, known, swift_module_map)
 
@@ -368,6 +393,16 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
         elif fi.lang == "swift":
             for ref in _parse_swift_imports(text):
                 resolved, is_ext = _resolve_swift_import(project_root, ref, known, swift_module_map)
+                if resolved and resolved in known:
+                    edges_set.add((src_rel, resolved))
+                elif is_ext:
+                    external.add(ref)
+        elif fi.lang == "java":
+            for m in JAVA_IMPORT_RE.finditer(text):
+                ref = m.group("pkg")
+                if not ref:
+                    continue
+                resolved, is_ext = _resolve_java_import(project_root, src_abs, ref, known, java_pkg_map)
                 if resolved and resolved in known:
                     edges_set.add((src_rel, resolved))
                 elif is_ext:

@@ -11,11 +11,15 @@ def summarize_index(index: dict, top_n: int = 20) -> dict:
     in_adj = adj.get("in") or {}
 
     node_map = {n.get("path"): n for n in nodes if n.get("path")}
+    # Build path->id map for adj lookup
+    path_to_id = {n["path"]: n["id"] for n in nodes if "id" in n and "path" in n}
+    id_to_path = {n["id"]: n["path"] for n in nodes if "id" in n and "path" in n}
 
     ranked: List[dict] = []
     for path, n in node_map.items():
-        out_deg = len(out_adj.get(path, []))
-        in_deg = len(in_adj.get(path, []))
+        nid = path_to_id.get(path)
+        out_deg = len(out_adj.get(str(nid), [])) if nid is not None else 0
+        in_deg = len(in_adj.get(str(nid), [])) if nid is not None else 0
         ranked.append(
             {
                 "path": path,
