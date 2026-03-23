@@ -536,6 +536,90 @@ def _collect_files(index: dict, paths: List[str], max_chars_per_file: int, max_t
     return files_out, used, truncated
 
 
+def _layered_file_relations(
+    index: dict,
+    file: str,
+    ordered: List[Tuple[str, int]],
+    bootstrap_roots: List[dict],
+    chain_scores: Dict[str, int],
+) -> dict:
+    in_adj, out_adj = _normalize_adj(index)
+    node_map = _node_map(index)
+    structure = _structure_map(index)
+    focal_syms = _focal_symbols(index, file)
+    bootstrap_paths = {item.get("path") for item in bootstrap_roots if item.get("path") and item.get("path") != file}
+
+    direct_deps: List[dict] = []
+    reverse_deps: List[dict] = []
+    symbol_related: List[dict] = []
+    entry_chain: List[dict] = []
+    siblings: List[dict] = []
+
+    file_dir = os.path.dirname(file)
+    used: Set[str] = set()
+
+    for path, dist in ordered:
+        if path == file or path not in node_map or path in used:
+            continue
+        item = {
+            "path": path,
+            "distance": dist,
+            "kind": _kind_for_path(path, (node_map[path].get("lang") or "other")),
+            "lang": node_map[path].get("lang"),
+            "chain_score": chain_scores.get(path, 0),
+        }
+        if path in out_adj.get(file, []):
+            direct_deps.append(item)
+            used.add(path)
+            continue
+        if path in in_adj.get(file, []):
+            reverse_deps.append(item)
+            used.add(path)
+            continue
+
+    for path, dist in ordered:
+        if path == file or path not in node_map or path in used:
+            continue
+        item = {
+            "path": path,
+            "distance": dist,
+            "kind": _kind_for_path(path, (node_map[path].get("lang") or "other")),
+            "lang": node_map[path].get("lang"),
+            "chain_score": chain_scores.get(path, 0),
+        }
+        info = structure.get(path) or {}
+        calls = {name for name, _recv in (info.get("calls") or []) if name}
+        defs = {name for name, _kind, _recv in (info.get("funcs") or []) if name}
+        classes = set(info.get("classes") or [])
+        if focal_syms & (calls | defs | classes):
+            symbol_related.append(item)
+            used.add(path)
+            continue
+        if path in bootstrap_paths or item["kind"] in {"config", "entry", "router"}:
+            entry_chain.append(item)
+            used.add(path)
+            continue
+        if os.path.dirname(path) == file_dir or _common_prefix_len(file, path) >= 3:
+            siblings.append(item)
+            used.add(path)
+            continue
+
+    return {
+        "focal": [{
+            "path": file,
+            "distance": 0,
+            "kind": _kind_for_path(file, (node_map[file].get("lang") or "other")),
+            "lang": node_map[file].get("lang"),
+            "chain_score": 0,
+        }],
+        "direct_deps": direct_deps[:8],
+        "reverse_deps": reverse_deps[:8],
+        "symbol_related": symbol_related[:8],
+        "entry_chain": entry_chain[:8],
+        "siblings": siblings[:8],
+    }
+
+
 def build_bootstrap_pack(
     index: dict,
     goal: str = "understand this repository",
@@ -669,6 +753,7 @@ def build_file_pack(
         }
         for p, d in ordered[:16]
     ]
+    layers = _layered_file_relations(index, file, ordered, bootstrap.get("selected_roots", [])[:4], chain_scores)
 
     return {
         "file": file,
@@ -677,6 +762,7 @@ def build_file_pack(
         "project_profile": profile,
         "bootstrap_roots": bootstrap.get("selected_roots", [])[:4],
         "related_files": related,
+        "layers": layers,
         "meta": {
             "returned_files": len(files),
             "returned_chars": used,
