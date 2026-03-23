@@ -15,7 +15,7 @@ DEFAULT_GOAL_WORDS = {
     "repository", "system", "feature", "logic",
 }
 
-PYTHON_SERVICE_HINTS = {
+PYTHON_HINTS = {
     "python", "backend", "server", "service", "model", "models", "view", "views",
     "controller", "controllers", "api", "worker", "task", "job", "jobs", "cli",
 }
@@ -33,6 +33,14 @@ IOS_HINTS = {
 }
 
 
+ARCH_FILES = {
+    "package.json", "tsconfig.json", "pyproject.toml", "requirements.txt", "setup.py",
+    "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties",
+    "podfile", "podfile.lock", "package.swift", "cartfile", "cartfile.resolved", "project.pbxproj",
+    "androidmanifest.xml",
+}
+
+
 def _file_text(root: str, rel_path: str, limit: int = 120000) -> str:
     abs_path = os.path.join(root, rel_path)
     try:
@@ -44,9 +52,7 @@ def _file_text(root: str, rel_path: str, limit: int = 120000) -> str:
 
 def _tokenize_goal(goal: str) -> List[str]:
     tokens = [w.lower() for w in WORD_RE.findall(goal)]
-    stop = {
-        "the", "and", "for", "with", "from", "into", "that", "this", "how", "what", "when", "where",
-    }
+    stop = {"the", "and", "for", "with", "from", "into", "that", "this", "how", "what", "when", "where"}
     return [t for t in tokens if t not in stop and t not in DEFAULT_GOAL_WORDS]
 
 
@@ -58,7 +64,7 @@ def _goal_profile(goal: str) -> str:
         return "android"
     if tokens & FRONTEND_HINTS:
         return "frontend"
-    if tokens & PYTHON_SERVICE_HINTS:
+    if tokens & PYTHON_HINTS:
         return "backend"
     return "generic"
 
@@ -87,264 +93,495 @@ def _normalize_adj(index: dict) -> Tuple[Dict[str, List[str]], Dict[str, List[st
     return convert(raw_in), convert(raw_out)
 
 
-def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
-    nodes = index.get("nodes") or []
-    root = (index.get("meta") or {}).get("project_root", "")
-    words = _tokenize_goal(goal)
-    profile = _goal_profile(goal)
-    in_adj, out_adj = _normalize_adj(index)
+def _node_map(index: dict) -> Dict[str, dict]:
+    return {n.get("path"): n for n in (index.get("nodes") or []) if n.get("path")}
 
-    scored: List[dict] = []
+
+def _path_parts(path: str) -> List[str]:
+    return [p for p in path.lower().split("/") if p]
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    ap = _path_parts(a)
+    bp = _path_parts(b)
+    n = 0
+    for x, y in zip(ap, bp):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _target_key(path: str) -> str:
+    parts = _path_parts(path)
+    if not parts:
+        return "root"
+    lowered = "/".join(parts)
+    for marker in ("example", "examples", "demo", "tests", "test"):
+        if marker in parts:
+            idx = parts.index(marker)
+            return "/".join(parts[: min(len(parts), idx + 2)])
+    if ".xcodeproj" in lowered:
+        idx = next((i for i, p in enumerate(parts) if p.endswith(".xcodeproj")), None)
+        if idx is not None:
+            return "/".join(parts[: idx + 1])
+    if "src" in parts:
+        idx = parts.index("src")
+        return "/".join(parts[: idx]) or "root"
+    if len(parts) >= 2:
+        return "/".join(parts[:2])
+    return parts[0]
+
+
+def _kind_for_path(path: str, lang: str) -> str:
+    low = path.lower()
+    base = os.path.basename(low)
+    if base in ARCH_FILES or low.endswith("androidmanifest.xml"):
+        return "config"
+    if base in {"main.py", "app.py", "manage.py", "wsgi.py", "asgi.py", "__main__.py", "main.m"}:
+        return "entry"
+    if base.endswith("appdelegate.swift") or base.endswith("appdelegate.m") or base.endswith("scenedelegate.swift"):
+        return "entry"
+    if base.endswith("application.java") or base.endswith("application.kt"):
+        return "entry"
+    if "route" in base or "router" in low or "urldispatch" in low or "urlroutes" in low or "rexxar" in low:
+        return "router"
+    if any(tok in low for tok in ("controller", "activity", "fragment", "viewcontroller")):
+        return "surface"
+    if any(tok in low for tok in ("service", "/api/", "manager", "handler")):
+        return "logic"
+    if any(tok in low for tok in ("model", "entity", "schema", "store")):
+        return "domain"
+    return "other"
+
+
+def _detect_project_profile(index: dict) -> dict:
+    nodes = index.get("nodes") or []
+    langs: Dict[str, int] = {}
     for n in nodes:
+        lang = n.get("lang") or "other"
+        langs[lang] = langs.get(lang, 0) + 1
+
+    paths = [n.get("path") or "" for n in nodes]
+    path_set = {p.lower() for p in paths}
+    tags: List[str] = []
+
+    if any(p.endswith("package.json") for p in path_set):
+        tags.append("node")
+    if any(p.endswith("androidmanifest.xml") or p.endswith("build.gradle") or p.endswith("settings.gradle") for p in path_set):
+        tags.append("android")
+    if any(p.endswith("project.pbxproj") or p.endswith("podfile") or p.endswith("package.swift") for p in path_set):
+        tags.append("ios")
+    if langs.get("python", 0) >= 10 or any(p.endswith("pyproject.toml") for p in path_set):
+        tags.append("python")
+    if langs.get("typescript", 0) + langs.get("javascript", 0) >= 20:
+        tags.append("frontend")
+    if len({p.split("/")[0] for p in paths if p}) >= 4:
+        tags.append("multimodule")
+
+    return {
+        "languages": langs,
+        "tags": tags,
+    }
+
+
+def _score_candidate(index: dict, path: str, lang: str, in_adj: Dict[str, List[str]], out_adj: Dict[str, List[str]], goal: str) -> dict:
+    root = (index.get("meta") or {}).get("project_root", "")
+    low_path = path.lower()
+    base = os.path.basename(low_path)
+    parts = _path_parts(path)
+    profile = _goal_profile(goal)
+    words = _tokenize_goal(goal)
+    in_degree = len(in_adj.get(path, []))
+    out_degree = len(out_adj.get(path, []))
+    kind = _kind_for_path(path, lang)
+    score = 0
+    why: List[str] = []
+
+    for w in words:
+        if w in low_path:
+            score += 18
+            why.append(f"path-match:{w}")
+
+    should_read = (
+        score > 0
+        or kind != "other"
+        or any(k in low_path for k in ("index", "app", "main", "delegate", "controller", "activity", "fragment", "model", "service", "router"))
+    )
+    text = _file_text(root, path, limit=25000) if should_read else ""
+    low_text = text.lower()
+    for w in words[:8]:
+        hits = low_text.count(w)
+        if hits:
+            score += min(24, hits * 3)
+            why.append(f"content-match:{w}x{hits}")
+
+    if lang == "python":
+        if base in {"main.py", "app.py", "manage.py", "wsgi.py", "asgi.py", "__main__.py"}:
+            score += 40
+            why.append("python-entry")
+        if base == "__init__.py":
+            score += 10
+            why.append("python-package")
+    elif lang in {"javascript", "typescript"}:
+        if base in {"package.json", "tsconfig.json"}:
+            score += 40
+            why.append("frontend-config")
+        if base.startswith("index."):
+            score += 14
+            why.append("index-file")
+    elif lang == "java" or low_path.endswith(".kt"):
+        if low_path.endswith("androidmanifest.xml"):
+            score += 90
+            why.append("android-manifest")
+        if base in {"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties"}:
+            score += 42
+            why.append("build-config")
+        if base.endswith("application.java") or base.endswith("application.kt"):
+            score += 56
+            why.append("application-class")
+        if base.endswith("activity.java") or base.endswith("activity.kt"):
+            score += 36
+            why.append("activity-class")
+        if base.endswith("fragment.java") or base.endswith("fragment.kt"):
+            score += 28
+            why.append("fragment-class")
+        if "rexxar" in low_text or "uridispatcher" in low_text or "routemanager" in low_text:
+            score += 18
+            why.append("navigation-or-rexxar")
+    elif lang == "swift":
+        if base in {"project.pbxproj", "podfile", "podfile.lock", "package.swift", "cartfile", "cartfile.resolved"}:
+            score += 48
+            why.append("ios-build-config")
+        if base.endswith("appdelegate.swift"):
+            score += 62
+            why.append("ios-app-entry")
+        if base.endswith("scenedelegate.swift"):
+            score += 40
+            why.append("ios-scene-entry")
+        if base.endswith("viewcontroller.swift"):
+            score += 28
+            why.append("ios-view-controller")
+        if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
+            score += 20
+            why.append("rexxar-or-routing")
+    elif lang == "objective-c":
+        if base in {"project.pbxproj", "podfile", "podfile.lock"}:
+            score += 48
+            why.append("ios-build-config")
+        if base == "main.m" or base.endswith("appdelegate.m") or base.endswith("appdelegate.h"):
+            score += 64
+            why.append("ios-app-entry")
+        if base.endswith("viewcontroller.m") or base.endswith("viewcontroller.h"):
+            score += 26
+            why.append("ios-view-controller")
+        if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
+            score += 20
+            why.append("rexxar-or-routing")
+
+    if kind == "config":
+        score += 20
+        why.append("architecture-file")
+    elif kind == "entry":
+        score += 16
+        why.append("entry-surface")
+    elif kind == "router":
+        score += 14
+        why.append("router")
+    elif kind == "surface":
+        score += 10
+        why.append("surface")
+    elif kind == "logic":
+        score += 8
+        why.append("logic")
+    elif kind == "domain":
+        score += 8
+        why.append("domain")
+
+    score += min(24, in_degree * 2)
+    score += min(16, out_degree * 2)
+
+    if profile == "backend":
+        if lang == "python":
+            score += 20
+            why.append("goal-prefers-backend")
+        elif lang in {"javascript", "typescript"} and "/components/" in low_path:
+            score -= 10
+    elif profile == "frontend":
+        if lang in {"javascript", "typescript"}:
+            score += 14
+            why.append("goal-prefers-frontend")
+        elif lang == "python":
+            score -= 8
+    elif profile == "android":
+        if low_path.endswith("androidmanifest.xml") or base in {"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties"} or lang == "java" or low_path.endswith(".kt"):
+            score += 24
+            why.append("goal-prefers-android")
+        if lang == "python":
+            score -= 12
+    elif profile == "ios":
+        if lang in {"swift", "objective-c"} or base in {"project.pbxproj", "podfile", "podfile.lock", "package.swift"}:
+            score += 24
+            why.append("goal-prefers-ios")
+        if lang == "python":
+            score -= 14
+    else:
+        if kind in {"config", "entry", "router"}:
+            score += 12
+            why.append("generic-architecture-bias")
+
+    if "/src/test/" in low_path or "/src/androidtest/" in low_path or "/tests/" in low_path:
+        score -= 42
+        why.append("test-penalty")
+    if low_path.startswith("scripts/") or low_path.startswith("dsymtool/"):
+        score -= 30
+        why.append("tooling-penalty")
+    if "proguard" in low_path:
+        score -= 30
+        why.append("build-noise-penalty")
+    if "/example/" in low_path or "/examples/" in low_path or "/demo/" in low_path:
+        score -= 14
+        why.append("example-penalty")
+
+    return {
+        "path": path,
+        "lang": lang,
+        "score": score,
+        "why": why[:8],
+        "kind": kind,
+        "target": _target_key(path),
+        "in_degree": in_degree,
+        "out_degree": out_degree,
+    }
+
+
+def _rank_candidates(index: dict, goal: str, limit: int = 40) -> List[dict]:
+    in_adj, out_adj = _normalize_adj(index)
+    ranked: List[dict] = []
+    for n in index.get("nodes") or []:
         path = n.get("path") or ""
         if not path:
             continue
-        lang = n.get("lang") or "other"
-        base = os.path.basename(path).lower()
-        low_path = path.lower()
-        parts = [p for p in low_path.split("/") if p]
-        in_degree = len(in_adj.get(path, []))
-        out_degree = len(out_adj.get(path, []))
+        item = _score_candidate(index, path, n.get("lang") or "other", in_adj, out_adj, goal)
+        if item["score"] > 0:
+            ranked.append(item)
+    ranked.sort(key=lambda x: (-x["score"], -x["in_degree"], x["path"]))
+    return ranked[:limit]
 
+
+def _select_diverse_roots(candidates: List[dict], limit: int = 4) -> List[dict]:
+    chosen: List[dict] = []
+    seen_paths: Set[str] = set()
+    seen_targets: Dict[str, int] = {}
+    seen_kinds: Set[str] = set()
+
+    preferred_kinds = ["config", "entry", "router", "surface", "logic", "domain"]
+    for kind in preferred_kinds:
+        for item in candidates:
+            if item["kind"] != kind or item["path"] in seen_paths:
+                continue
+            if seen_targets.get(item["target"], 0) >= 2:
+                continue
+            chosen.append(item)
+            seen_paths.add(item["path"])
+            seen_targets[item["target"]] = seen_targets.get(item["target"], 0) + 1
+            seen_kinds.add(item["kind"])
+            break
+        if len(chosen) >= limit:
+            return chosen
+
+    for item in candidates:
+        if item["path"] in seen_paths:
+            continue
+        target_hits = seen_targets.get(item["target"], 0)
+        if target_hits >= 2:
+            continue
+        if item["kind"] in seen_kinds and len(chosen) < max(2, limit - 1):
+            continue
+        chosen.append(item)
+        seen_paths.add(item["path"])
+        seen_targets[item["target"]] = target_hits + 1
+        seen_kinds.add(item["kind"])
+        if len(chosen) >= limit:
+            return chosen
+
+    for item in candidates:
+        if item["path"] in seen_paths:
+            continue
+        chosen.append(item)
+        seen_paths.add(item["path"])
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def _collect_files(index: dict, paths: List[str], max_chars_per_file: int, max_total_chars: Optional[int]) -> Tuple[List[dict], int, int]:
+    node_map = _node_map(index)
+    root = (index.get("meta") or {}).get("project_root", "")
+    files_out: List[dict] = []
+    used = 0
+    truncated = 0
+    seen: Set[str] = set()
+
+    for path in paths:
+        if path in seen or path not in node_map:
+            continue
+        seen.add(path)
+        raw = _file_text(root, path, limit=max_chars_per_file)
+        content = raw
+        was_truncated = False
+        if len(raw) >= max_chars_per_file:
+            was_truncated = True
+        if max_total_chars is not None and used + len(content) > max_total_chars:
+            remain = max(0, max_total_chars - used)
+            content = content[:remain] + ("\n\n/* ...TRUNCATED (pack limit)... */\n" if remain > 0 else "")
+            was_truncated = True
+        used += len(content)
+        n = node_map[path]
+        files_out.append({
+            "path": path,
+            "distance": None,
+            "lang": n.get("lang"),
+            "lines": n.get("lines"),
+            "size": n.get("size"),
+            "truncated": was_truncated,
+            "content": content,
+        })
+        if was_truncated:
+            truncated += 1
+        if max_total_chars is not None and used >= max_total_chars:
+            break
+    return files_out, used, truncated
+
+
+def build_bootstrap_pack(
+    index: dict,
+    goal: str = "understand this repository",
+    limit_roots: int = 6,
+    max_chars_per_file: int = 12000,
+    max_total_chars: Optional[int] = None,
+) -> dict:
+    profile = _detect_project_profile(index)
+    entrypoints = detect_entrypoints(index, top_n=20).get("entrypoints", [])
+    candidates = _rank_candidates(index, goal=goal, limit=50)
+    roots = _select_diverse_roots(candidates, limit=limit_roots)
+    root_paths = [r["path"] for r in roots]
+    files, used, truncated = _collect_files(index, root_paths, max_chars_per_file, max_total_chars)
+    return {
+        "goal": goal,
+        "project_profile": profile,
+        "entry_candidates": entrypoints[:10],
+        "selected_roots": roots,
+        "meta": {
+            "returned_files": len(files),
+            "returned_chars": used,
+            "estimated_tokens": estimate_tokens_from_chars(used),
+            "truncated_files": truncated,
+        },
+        "files": files,
+    }
+
+
+def build_file_pack(
+    index: dict,
+    file: str,
+    goal: Optional[str] = None,
+    hops: int = 1,
+    page_size: int = 12,
+    max_chars_per_file: int = 12000,
+    max_total_chars: Optional[int] = None,
+) -> dict:
+    in_adj, out_adj = _normalize_adj(index)
+    node_map = _node_map(index)
+    if file not in node_map:
+        raise KeyError(f"file not in index: {file}")
+
+    profile = _detect_project_profile(index)
+    ctx = build_context_pack(
+        index=index,
+        file=file,
+        hops=hops,
+        direction="both",
+        page=1,
+        page_size=page_size,
+        max_chars_per_file=max_chars_per_file,
+        max_total_chars=max_total_chars,
+    )
+
+    base_candidates: List[Tuple[str, int]] = []
+    for f in ctx.get("files", []):
+        dist = f.get("distance")
+        base_candidates.append((f["path"], 0 if dist is None else dist))
+
+    directory = os.path.dirname(file)
+    kind = _kind_for_path(file, (node_map[file].get("lang") or "other"))
+    for path in node_map:
+        if path == file:
+            continue
         score = 0
-        why: List[str] = []
-
-        for w in words:
-            if w in low_path:
-                score += 18
-                why.append(f"path-match:{w}")
-
-        is_android_manifest = low_path.endswith("androidmanifest.xml")
-        is_gradle = base in {"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties"}
-        is_android_main = "/src/main/" in low_path
-        is_android_test = "/src/test/" in low_path or "/src/androidtest/" in low_path
-        is_proguard = "proguard" in low_path
-        is_debug = "/debug/" in low_path
-        is_android_java = lang == "java" or low_path.endswith(".kt")
-        is_ios_swift = lang == "swift"
-        is_ios_objc = lang == "objective-c"
-        is_ios_build = base in {"project.pbxproj", "package.swift", "podfile", "podfile.lock", "cartfile", "cartfile.resolved"}
-        is_ios_tooling = low_path.startswith("scripts/") or low_path.startswith("dsymtool/")
-
-        should_read = (
-            score > 0
-            or any(k in low_path for k in ("index", "app", "main", "service", "page", "route", "map", "widget", "component", "model", "view", "manifest", "gradle", "activity", "fragment", "delegate", "podfile", "xcodeproj"))
-            or (lang == "python" and base == "__init__.py")
-            or is_android_manifest
-            or is_gradle
-            or is_ios_build
-        )
-
-        text = ""
-        if should_read:
-            text = _file_text(root, path, limit=30000)
-            low_text = text.lower()
-            for w in words[:8]:
-                hits = low_text.count(w)
-                if hits:
-                    score += min(24, hits * 3)
-                    why.append(f"content-match:{w}x{hits}")
-        else:
-            low_text = ""
-
-        if path.endswith("map.json"):
-            score += 16
-            why.append("route-map")
-
-        if "/page/" in low_path:
+        if os.path.dirname(path) == directory:
+            score += 10
+        score += _common_prefix_len(file, path) * 3
+        if _kind_for_path(path, node_map[path].get("lang") or "other") == kind:
             score += 8
-            why.append("page")
-        if "/service/" in low_path:
-            score += 7
-            why.append("service")
-        if "/widget/" in low_path or "/components/" in low_path:
-            score += 3
-            why.append("ui")
-
-        if lang == "python":
-            if base in {"main.py", "app.py", "manage.py", "wsgi.py", "asgi.py", "__main__.py"}:
-                score += 30
-                why.append("python-entry")
-            if base == "__init__.py":
-                score += 18
-                why.append("python-package")
-            if any(seg in {"model", "models", "view", "views", "service", "api", "controller", "controllers"} for seg in parts[:-1]):
-                score += 14
-                why.append("python-domain")
-            score += min(24, in_degree * 2)
-            score += min(14, out_degree)
-        elif lang in {"typescript", "javascript"}:
-            if base.startswith("index."):
-                score += 10
-                why.append("index-file")
-            score += min(16, in_degree * 2)
-            score += min(12, out_degree)
-        elif is_android_java:
-            if is_android_main:
-                score += 12
-                why.append("android-main-src")
-            if base.endswith("application.java") or base.endswith("application.kt"):
-                score += 50
-                why.append("application-class")
-            if base.endswith("activity.java") or base.endswith("activity.kt"):
-                score += 32
-                why.append("activity-class")
-            if base.endswith("fragment.java") or base.endswith("fragment.kt"):
-                score += 22
-                why.append("fragment-class")
-            if "/api/" in low_path:
-                score += 4
-                why.append("api-layer")
-            if " extends application" in low_text or "extends multidexapplication" in low_text:
-                score += 44
-                why.append("extends-application")
-            if " extends activity" in low_text or " extends appcompatactivity" in low_text or " extends baseactivity" in low_text:
-                score += 24
-                why.append("extends-activity")
-            if " extends fragment" in low_text or " extends dialogfragment" in low_text:
-                score += 18
-                why.append("extends-fragment")
-            if "rexxar" in low_text or "routemanager" in low_text or "uridispatcher" in low_text:
-                score += 18
-                why.append("navigation-or-rexxar")
-            score += min(22, in_degree * 2)
-            score += min(14, out_degree)
-        elif is_ios_swift:
-            if is_ios_build:
-                score += 34
-                why.append("ios-build-config")
-            if base.endswith("appdelegate.swift"):
-                score += 60
-                why.append("ios-app-entry")
-            if base.endswith("scenedelegate.swift"):
-                score += 42
-                why.append("ios-scene-entry")
-            if base.endswith("viewcontroller.swift"):
-                score += 26
-                why.append("ios-view-controller")
-            if base.endswith("coordinator.swift"):
-                score += 20
-                why.append("ios-coordinator")
-            if any(seg in parts for seg in ("source", "sources", "controller", "controllers", "router", "routing", "coordinator", "widget")):
-                score += 10
-                why.append("ios-structure-area")
-            if "@main" in low_text or "uiapplicationmain" in low_text:
-                score += 34
-                why.append("ios-main-annotation")
-            if "class appdelegate" in low_text or ": uiresponder, uiapplicationdelegate" in low_text:
-                score += 36
-                why.append("app-delegate")
-            if "class scenedelegate" in low_text or "uiscenedelegate" in low_text:
-                score += 24
-                why.append("scene-delegate")
-            if "uiviewcontroller" in low_text or "uitabbarcontroller" in low_text or "uinavigationcontroller" in low_text:
-                score += 16
-                why.append("ui-entry-surface")
-            if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
-                score += 18
-                why.append("rexxar-or-routing")
-            score += min(10, in_degree * 2)
-            score += min(8, out_degree)
-        elif is_ios_objc:
-            if is_ios_build:
-                score += 34
-                why.append("ios-build-config")
-            if base.endswith("appdelegate.m") or base.endswith("appdelegate.h") or base == "main.m":
-                score += 62
-                why.append("ios-app-entry")
-            if base.endswith("viewcontroller.m") or base.endswith("viewcontroller.h"):
-                score += 24
-                why.append("ios-view-controller")
-            if any(seg in parts for seg in ("controller", "controllers", "router", "routing", "coordinator", "utils")):
-                score += 10
-                why.append("ios-structure-area")
-            if "uiapplicationmain" in low_text or "didfinishlaunchingwithoptions" in low_text:
-                score += 36
-                why.append("app-delegate")
-            if "uiviewcontroller" in low_text or "uitabbarcontroller" in low_text or "uinavigationcontroller" in low_text:
-                score += 16
-                why.append("ui-entry-surface")
-            if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
-                score += 18
-                why.append("rexxar-or-routing")
-            score += min(8, in_degree * 2)
-            score += min(6, out_degree)
-        else:
-            score += min(10, in_degree)
-            score += min(8, out_degree)
-
-        if is_android_manifest:
-            score += 90
-            why.append("android-manifest")
-        if is_gradle:
-            score += 30
-            why.append("build-config")
-
-        if profile == "backend":
-            if lang == "python":
-                score += 18
-                why.append("goal-prefers-backend")
-            elif lang in {"typescript", "javascript"} and "/components/" in low_path:
-                score -= 12
-        elif profile == "frontend":
-            if lang in {"typescript", "javascript"}:
-                score += 12
-                why.append("goal-prefers-frontend")
-            elif lang == "python":
-                score -= 8
-        elif profile == "android":
-            if is_android_manifest or is_gradle or is_android_java:
-                score += 22
-                why.append("goal-prefers-android")
-            if lang == "python":
-                score -= 10
-        elif profile == "ios":
-            if is_ios_swift or is_ios_objc or is_ios_build:
-                score += 24
-                why.append("goal-prefers-ios")
-            if lang == "python":
-                score -= 14
-        else:
-            if lang == "python" and any(seg in {"model", "models", "view", "views", "service"} for seg in parts[:-1]):
-                score += 8
-                why.append("generic-python-bias")
-            if is_android_manifest or (is_gradle and "/app/" in low_path):
-                score += 18
-                why.append("generic-architecture-bias")
-            if is_android_java and (base.endswith("application.java") or base.endswith("activity.java") or base.endswith("fragment.java")):
-                score += 14
-                why.append("generic-android-bias")
-            if is_ios_build or is_ios_objc or base.endswith("appdelegate.swift") or base.endswith("scenedelegate.swift"):
-                score += 18
-                why.append("generic-ios-bias")
-
-        if is_android_test:
-            score -= 42
-            why.append("test-penalty")
-        if is_debug:
-            score -= 16
-            why.append("debug-penalty")
-        if is_proguard:
-            score -= 30
-            why.append("build-noise-penalty")
-        if is_ios_tooling:
-            score -= 28
-            why.append("tooling-penalty")
-
+        if path in out_adj.get(file, []):
+            score += 18
+        if path in in_adj.get(file, []):
+            score += 16
         if score > 0:
-            scored.append(
-                {
-                    "path": path,
-                    "lang": lang,
-                    "score": score,
-                    "why": why[:8],
-                    "in_degree": in_degree,
-                    "out_degree": out_degree,
-                }
-            )
+            base_candidates.append((path, 10 - min(9, score // 4)))
 
-    scored.sort(key=lambda x: (-x["score"], -x["in_degree"], x["path"]))
-    return scored[:limit]
+    bootstrap = build_bootstrap_pack(
+        index=index,
+        goal=goal or f"understand context around {file}",
+        limit_roots=4,
+        max_chars_per_file=max_chars_per_file,
+        max_total_chars=None,
+    )
+    for item in bootstrap.get("selected_roots", []):
+        if item["path"] != file:
+            base_candidates.append((item["path"], 2))
+
+    best_dist: Dict[str, int] = {}
+    for path, dist in base_candidates:
+        if path not in best_dist or dist < best_dist[path]:
+            best_dist[path] = dist
+
+    ordered = sorted(best_dist.items(), key=lambda kv: (kv[1], -int((node_map.get(kv[0]) or {}).get("size") or 0), kv[0]))
+    ordered_paths = [p for p, _ in ordered]
+    per_file_chars = max_chars_per_file
+    if max_total_chars is not None and ordered_paths:
+        per_file_chars = min(max_chars_per_file, max(1500, max_total_chars // min(6, len(ordered_paths))))
+    files, used, truncated = _collect_files(index, ordered_paths, per_file_chars, max_total_chars)
+    for f in files:
+        if f["path"] in best_dist:
+            f["distance"] = best_dist[f["path"]]
+
+    related = [
+        {
+            "path": p,
+            "distance": d,
+            "kind": _kind_for_path(p, (node_map[p].get("lang") or "other")),
+            "lang": node_map[p].get("lang"),
+        }
+        for p, d in ordered[:12]
+    ]
+
+    return {
+        "file": file,
+        "goal": goal,
+        "project_profile": profile,
+        "bootstrap_roots": bootstrap.get("selected_roots", [])[:4],
+        "related_files": related,
+        "meta": {
+            "returned_files": len(files),
+            "returned_chars": used,
+            "estimated_tokens": estimate_tokens_from_chars(used),
+            "truncated_files": truncated,
+            "hops": hops,
+        },
+        "files": files,
+    }
 
 
 def build_goal_pack(
@@ -356,41 +593,32 @@ def build_goal_pack(
     max_chars_per_file: int = 16000,
     max_total_chars: Optional[int] = None,
 ) -> dict:
-    entrypoints = detect_entrypoints(index, top_n=20).get("entrypoints", [])
-    candidates = _score_files(index, goal, limit=16)
-
-    chosen: List[dict] = []
-    seen_roots: Set[str] = set()
-    for item in candidates:
-        path = item["path"]
-        if path in seen_roots:
-            continue
-        chosen.append(item)
-        seen_roots.add(path)
-        if len(chosen) >= 4:
-            break
-
+    del page  # reserved for future paging; keep CLI compatibility
+    bootstrap = build_bootstrap_pack(
+        index=index,
+        goal=goal,
+        limit_roots=4,
+        max_chars_per_file=max_chars_per_file,
+        max_total_chars=max_total_chars,
+    )
+    selected = bootstrap.get("selected_roots", [])
     packs: List[dict] = []
     seen: Set[str] = set()
     used = 0
     truncated_files = 0
 
-    for idx, item in enumerate(chosen):
+    for idx, item in enumerate(selected):
         remaining = None if max_total_chars is None else max(0, max_total_chars - used)
         if remaining == 0:
             break
-
-        remaining_roots = max(1, len(chosen) - idx)
-        per_root_budget = None
-        if remaining is not None:
-            per_root_budget = max(2500, remaining // remaining_roots)
-
+        remaining_roots = max(1, len(selected) - idx)
+        per_root_budget = None if remaining is None else max(2500, remaining // remaining_roots)
         p = build_context_pack(
             index=index,
             file=item["path"],
             hops=hops,
             direction="both",
-            page=page,
+            page=1,
             page_size=page_size,
             max_chars_per_file=min(max_chars_per_file, per_root_budget or max_chars_per_file),
             max_total_chars=per_root_budget,
@@ -408,18 +636,17 @@ def build_goal_pack(
         if max_total_chars is not None and used >= max_total_chars:
             break
 
-    packs.sort(key=lambda f: (f.get("distance", 999), -(f.get("size") or 0), f.get("path", "")))
-
+    packs.sort(key=lambda f: ((f.get("distance") if f.get("distance") is not None else 999), -(f.get("size") or 0), f.get("path", "")))
     return {
         "goal": goal,
-        "entry_candidates": entrypoints[:10],
-        "selected_roots": chosen,
+        "project_profile": bootstrap.get("project_profile"),
+        "entry_candidates": bootstrap.get("entry_candidates", [])[:10],
+        "selected_roots": selected,
         "meta": {
             "returned_files": len(packs),
             "returned_chars": used,
             "estimated_tokens": estimate_tokens_from_chars(used),
             "truncated_files": truncated_files,
-            "page": page,
             "page_size": page_size,
             "hops": hops,
         },

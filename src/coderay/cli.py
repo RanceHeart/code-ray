@@ -8,7 +8,7 @@ from typing import List, Optional
 from .analyzer import build_index
 from .context import build_context_pack
 from .entrypoints import detect_entrypoints
-from .pack import build_goal_pack
+from .pack import build_bootstrap_pack, build_file_pack, build_goal_pack
 from .scanner import scan_project
 from .summary import summarize_index
 from .symbols import find_symbol
@@ -75,6 +75,34 @@ def _cmd_symbol(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bootstrap(args: argparse.Namespace) -> int:
+    index = _load_index(args.index)
+    pack = build_bootstrap_pack(
+        index=index,
+        goal=args.goal,
+        limit_roots=args.limit_roots,
+        max_chars_per_file=args.max_chars_per_file,
+        max_total_chars=args.max_total_chars or chars_from_token_budget(args.budget_tokens),
+    )
+    print(json.dumps(pack, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_filepack(args: argparse.Namespace) -> int:
+    index = _load_index(args.index)
+    pack = build_file_pack(
+        index=index,
+        file=args.file,
+        goal=args.goal,
+        hops=args.hops,
+        page_size=args.page_size,
+        max_chars_per_file=args.max_chars_per_file,
+        max_total_chars=args.max_total_chars or chars_from_token_budget(args.budget_tokens),
+    )
+    print(json.dumps(pack, ensure_ascii=False, indent=2))
+    return 0
+
+
 def _cmd_pack(args: argparse.Namespace) -> int:
     index = _load_index(args.index)
     pack = build_goal_pack(
@@ -124,6 +152,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     pe.add_argument("--index", required=True)
     pe.add_argument("--top-n", type=int, default=20)
     pe.set_defaults(fn=_cmd_entrypoints)
+
+    pb = sub.add_parser("bootstrap", help="build a project-start context pack for an unfamiliar repo")
+    pb.add_argument("--index", required=True)
+    pb.add_argument("--goal", default="understand this repository")
+    pb.add_argument("--limit-roots", type=int, default=6)
+    pb.add_argument("--max-chars-per-file", type=int, default=12000)
+    pb.add_argument("--max-total-chars", type=int, default=None)
+    pb.add_argument("--budget-tokens", type=int, default=None)
+    pb.set_defaults(fn=_cmd_bootstrap)
+
+    pf = sub.add_parser("filepack", help="build a file-centric context pack from one focal file")
+    pf.add_argument("--index", required=True)
+    pf.add_argument("--file", required=True)
+    pf.add_argument("--goal", default=None)
+    pf.add_argument("--hops", type=int, default=1)
+    pf.add_argument("--page-size", type=int, default=12)
+    pf.add_argument("--max-chars-per-file", type=int, default=12000)
+    pf.add_argument("--max-total-chars", type=int, default=None)
+    pf.add_argument("--budget-tokens", type=int, default=None)
+    pf.set_defaults(fn=_cmd_filepack)
 
     pys = sub.add_parser("symbol", help="find likely files for a symbol/class/function name")
     pys.add_argument("--index", required=True)
