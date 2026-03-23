@@ -27,6 +27,31 @@ def _read_file(abs_path: str, max_chars: int, head_tail: bool = True) -> str:
     return data[:half] + "\n\n/* ...TRUNCATED (middle)... */\n\n" + data[-half:]
 
 
+def _normalize_adj(index: dict) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    adj = index.get("adj") or {}
+    raw_out = adj.get("out") or {}
+    raw_in = adj.get("in") or {}
+    nodes = index.get("nodes") or []
+
+    id_to_path = {str(n.get("id")): n.get("path") for n in nodes if n.get("path") is not None and n.get("id") is not None}
+
+    def convert(raw: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for key, vals in raw.items():
+            src = id_to_path.get(str(key), key)
+            if not src:
+                continue
+            mapped: List[str] = []
+            for v in vals or []:
+                tgt = id_to_path.get(str(v), v)
+                if tgt:
+                    mapped.append(tgt)
+            out[src] = sorted(set(mapped))
+        return out
+
+    return convert(raw_out), convert(raw_in)
+
+
 def _bfs_neighborhood(
     start: str,
     out_adj: Dict[str, List[str]],
@@ -80,8 +105,7 @@ def build_context_pack(
     if budget_tokens is not None and max_total_chars is None:
         max_total_chars = chars_from_token_budget(budget_tokens)
 
-    out_adj = (index.get("adj") or {}).get("out") or {}
-    in_adj = (index.get("adj") or {}).get("in") or {}
+    out_adj, in_adj = _normalize_adj(index)
 
     nodes = index.get("nodes") or []
     node_map = {n.get("path"): n for n in nodes if n.get("path")}
@@ -91,7 +115,7 @@ def build_context_pack(
     for path, dist in neighborhood:
         size = int((node_map.get(path) or {}).get("size") or 0)
         scored.append((path, dist, size))
-    scored.sort(key=lambda t: (t[1], t[2], t[0]))
+    scored.sort(key=lambda t: (t[1], -t[2], t[0]))
 
     if page_size <= 0:
         page_size = 20
@@ -110,8 +134,8 @@ def build_context_pack(
 
     for path, dist, _size in page_items:
         abs_path = os.path.join(root, path)
-        content = _read_file(abs_path, max_chars=max_chars_per_file, head_tail=True)
-        original_len = len(content)
+        raw_content = _read_file(abs_path, max_chars=max_chars_per_file, head_tail=True)
+        content = raw_content
 
         if max_total_chars is not None:
             if used >= max_total_chars:
@@ -130,7 +154,7 @@ def build_context_pack(
                 "lang": n.get("lang"),
                 "lines": n.get("lines"),
                 "size": n.get("size"),
-                "truncated": len(content) < original_len,
+                "truncated": content != raw_content,
                 "content": content,
             }
         )

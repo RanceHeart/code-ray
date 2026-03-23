@@ -314,6 +314,7 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
             "path": fi.path,
             "lang": fi.lang,
             "lines": fi.lines,
+            "size": fi.size,
         }
         for fi in files
     ]
@@ -339,20 +340,26 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
         src_abs = abs_by_rel[src_rel]
 
         if ts_parser:
-            # Try tree-sitter parsing first
+            # Use tree-sitter for structure extraction, but keep import resolution
+            # conservative for Python where regex import parsing is currently more
+            # reliable than our AST import walker.
             parsed: ParsedFile = ts_parser.parse(src_abs, fi.lang)
-            if parsed.imports or parsed.func_defs or parsed.func_calls or parsed.classes:
-                # Store structure info
+            if parsed.func_defs or parsed.func_calls or parsed.classes or parsed.imports:
+                # Prefer regex-derived imports for Python to avoid malformed module names.
+                if fi.lang == "python":
+                    import_refs = _parse_py_imports(_read_text(src_abs))
+                else:
+                    import_refs = [imp.path for imp in parsed.imports]
+
                 structure[src_rel] = {
-                    "imports": [imp.path for imp in parsed.imports],
+                    "imports": import_refs,
                     "funcs": [(f.name, f.kind, f.receiver) for f in parsed.func_defs],
                     "calls": [(c.name, c.recv) for c in parsed.func_calls],
                     "classes": parsed.classes,
                 }
 
                 # Resolve imports to edges
-                for imp in parsed.imports:
-                    ref = imp.path
+                for ref in import_refs:
                     if not ref:
                         continue
                     resolved: Optional[str] = None

@@ -4,6 +4,7 @@ src/code_ray.egg-info/PKG-INFO
 src/code_ray.egg-info/SOURCES.txt
 src/code_ray.egg-info/dependency_links.txt
 src/code_ray.egg-info/entry_points.txt
+src/code_ray.egg-info/requires.txt
 src/code_ray.egg-info/top_level.txt
 src/coderay/__init__.py
 src/coderay/analyzer.py
@@ -11,6 +12,7 @@ src/coderay/cli.py
 src/coderay/context.py
 src/coderay/entrypoints.py
 src/coderay/pack.py
+src/coderay/parser.py
 src/coderay/project_hints.py
 src/coderay/scanner.py
 src/coderay/summary.py
