@@ -1,88 +1,201 @@
 # code-ray
 
-`code-ray` is a repo-context CLI for AI agents, especially OpenClaw-style workflows.
+`code-ray` is a repo-scout CLI for AI agents.
 
-It does four main things:
+It is built for one job:
 
-1. **xray** — scan a project and build a file-level dependency index
-2. **summary** — show dependency hotspots first
-3. **ctx** — fetch a file-neighborhood context pack with paging-by-file
-4. **pack** — fetch a task-oriented context pack from a goal string
+> **Find the few files worth reading next.**
 
-It is inspired by `code-xray`, but is **agent-first**: precompute once, then pull small, targeted packs instead of reading an entire repo line-by-line.
+Use it when an AI enters an unfamiliar repository, needs context around one file, or needs a task-oriented reconnaissance pass before deep reading.
 
-## Install (dev)
+---
+
+# What it does
+
+`code-ray` gives you small, targeted context instead of forcing line-by-line repo crawling.
+
+Main commands:
+
+- `xray` — build an index for a repo
+- `bootstrap` — get initial repo roots (entry/config/router/domain)
+- `filepack` — gather context around one focal file
+- `pack --goal` — gather task-oriented context when no focal file is known yet
+- `entrypoints` — detect likely lifecycle / startup / route roots
+- `symbol` — find files matching a symbol or domain term
+
+---
+
+# One-command install
+
+## Recommended: install the CLI only
 
 ```bash
 cd /Users/qili/PycharmProjects/code-ray
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+bash scripts/install.sh
 ```
 
-## Commands
+This installs `coderay` using:
+- `uv tool install` if available
+- otherwise `pipx`
+- otherwise `python3 -m pip install --user`
 
-### Build an index
+---
+
+## Install the CLI and copy the OpenClaw skill
 
 ```bash
-coderay xray . --out .coderay/index.json
+cd /Users/qili/PycharmProjects/code-ray
+bash scripts/install.sh --workspace ~/.openclaw/workspace-opus46 --with-skill
 ```
 
-Useful flags:
+This will:
+- install `coderay`
+- copy `skills/repo-context/SKILL.md` into:
+  - `~/.openclaw/workspace-opus46/skills/repo-context/SKILL.md`
 
-- `--exclude node_modules .git dist build .venv venv`
-- `--max-files 5000`
-- `--max-bytes 300000`
+If your OpenClaw workspace is elsewhere, replace the path.
 
-### Show hotspots
+---
+
+# AI-friendly quick start
+
+If an agent can run shell commands, this is the shortest reliable setup:
 
 ```bash
-coderay summary --index .coderay/index.json --top-n 20
+cd /Users/qili/PycharmProjects/code-ray && bash scripts/install.sh --workspace ~/.openclaw/workspace-opus46 --with-skill
 ```
 
-### Detect entrypoints / route maps
+Then in a target repo:
 
 ```bash
-coderay entrypoints --index .coderay/index.json --top-n 20
+coderay xray . --out .coderay/index.json --exclude node_modules .git .idea .cache
+coderay bootstrap --index .coderay/index.json --goal "understand this repository" --budget-tokens 4000
 ```
 
-### Find symbol candidates
+If a focal file already exists:
 
 ```bash
-coderay symbol --index .coderay/index.json --name Intro
+coderay filepack --index .coderay/index.json --file path/to/file.ts --mode full-chain --budget-tokens 6000
 ```
 
-### Fetch file-neighborhood context
+---
+
+# Install manually
+
+If you prefer manual install:
+
+## with uv
 
 ```bash
-coderay ctx --index .coderay/index.json --file src/subject/page/intro/index.tsx --hops 1 --budget-tokens 4000
+uv tool install /Users/qili/PycharmProjects/code-ray
 ```
 
-### Fetch goal-oriented context
+## with pipx
 
 ```bash
-coderay pack --index .coderay/index.json --goal "understand subject intro data flow" --budget-tokens 5000
+pipx install /Users/qili/PycharmProjects/code-ray
 ```
 
-## Design choices
+## with pip
 
-- **paging is by file**, not line
-- **budget can be token-oriented** (`--budget-tokens`)
-- **TS alias resolution** supports common `tsconfig.json` patterns such as `@/*`
-- **goal pack** is heuristic, not semantic search; it is meant to be cheap and local
+```bash
+python3 -m pip install --user /Users/qili/PycharmProjects/code-ray
+```
 
-## OpenClaw usage pattern
+---
 
-Recommended loop for code tasks:
+# Typical workflow
 
-1. `coderay xray`
-2. `coderay summary`
-3. `coderay entrypoints` or `coderay symbol`
-4. `coderay ctx` or `coderay pack`
-5. Only then `read` specific files deeply
+## 1. Build an index
 
-## Notes
+```bash
+coderay xray . --out .coderay/index.json --exclude node_modules .git .idea .cache
+```
 
-- Parsing is approximate and regex-based by design.
-- Python + JS/TS dependency extraction is supported.
-- Other file types still enter the node set and may appear in packs when heuristics match.
+Useful excludes for larger repos:
+- `dist`
+- `build`
+- `.next`
+- `.venv`
+- `Pods`
+- `DerivedData`
+
+---
+
+## 2. If the repo is unfamiliar, start with bootstrap
+
+```bash
+coderay bootstrap --index .coderay/index.json --goal "understand this repository" --budget-tokens 4000
+```
+
+Use this to quickly find:
+- entrypoints
+- config files
+- routers
+- domain roots
+- likely files to read first
+
+---
+
+## 3. If one file already matters, use filepack
+
+```bash
+coderay filepack --index .coderay/index.json --file src/server/models/page.ts --budget-tokens 5000
+```
+
+For a broader chain around the file:
+
+```bash
+coderay filepack --index .coderay/index.json --file src/server/models/page.ts --mode full-chain --goal "trace storage and recompute flow" --budget-tokens 6000
+```
+
+---
+
+## 4. If the task is known but the file is not, use goal pack
+
+```bash
+coderay pack --index .coderay/index.json --goal "understand stamp business logic and data storage" --budget-tokens 5000
+```
+
+Then pick one returned root and switch to `filepack`.
+
+---
+
+# Why this exists
+
+Most AI repo exploration fails in one of two ways:
+
+1. it reads too much
+2. it reads the wrong few files
+
+`code-ray` is meant to be the middle layer:
+
+- cheap local scouting
+- token-aware context packs
+- better first-file selection
+- less blind exploration
+
+It is a **scout**, not the final analyst.
+
+---
+
+# OpenClaw skill included in this repo
+
+This repo ships with:
+
+- `skills/repo-context/SKILL.md`
+
+That skill documents the intended usage pattern for AI agents, including:
+- when to use `bootstrap`
+- when to use `filepack`
+- when to use `full-chain`
+- when raw search is better
+- common failure modes
+
+---
+
+# Notes
+
+- Parsing is intentionally approximate and fast.
+- Results are meant to narrow scope, not replace code reading.
+- Once you have the right 3-8 files, stop scouting and read the code.
