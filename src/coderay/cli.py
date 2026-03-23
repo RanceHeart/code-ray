@@ -98,6 +98,7 @@ def _cmd_filepack(args: argparse.Namespace) -> int:
         page_size=args.page_size,
         max_chars_per_file=args.max_chars_per_file,
         max_total_chars=args.max_total_chars or chars_from_token_budget(args.budget_tokens),
+        mode=args.mode,
     )
     print(json.dumps(pack, ensure_ascii=False, indent=2))
     return 0
@@ -166,6 +167,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pf.add_argument("--index", required=True)
     pf.add_argument("--file", required=True)
     pf.add_argument("--goal", default=None)
+    pf.add_argument("--mode", choices=["standard", "full-chain"], default="standard")
     pf.add_argument("--hops", type=int, default=1)
     pf.add_argument("--page-size", type=int, default=12)
     pf.add_argument("--max-chars-per-file", type=int, default=12000)

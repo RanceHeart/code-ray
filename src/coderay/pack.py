@@ -415,6 +415,88 @@ def _select_diverse_roots(candidates: List[dict], limit: int = 4) -> List[dict]:
     return chosen
 
 
+def _structure_map(index: dict) -> Dict[str, dict]:
+    return index.get("structure") or {}
+
+
+def _focal_symbols(index: dict, file: str) -> Set[str]:
+    structure = _structure_map(index)
+    info = structure.get(file) or {}
+    out: Set[str] = set()
+    for name, _kind, _recv in info.get("funcs") or []:
+        if name:
+            out.add(name)
+    for name in info.get("classes") or []:
+        if name:
+            out.add(name)
+    return out
+
+
+def _chain_candidates(index: dict, file: str, hops: int = 2) -> List[Tuple[str, int, int]]:
+    in_adj, out_adj = _normalize_adj(index)
+    structure = _structure_map(index)
+    node_map = _node_map(index)
+    focal_syms = _focal_symbols(index, file)
+
+    scored: Dict[str, Tuple[int, int]] = {}
+
+    def push(path: str, distance: int, score: int):
+        if path == file or path not in node_map:
+            return
+        prev = scored.get(path)
+        if prev is None or distance < prev[0] or (distance == prev[0] and score > prev[1]):
+            scored[path] = (distance, score)
+
+    for path in out_adj.get(file, []):
+        push(path, 1, 100)
+    for path in in_adj.get(file, []):
+        push(path, 1, 90)
+
+    frontier = list(out_adj.get(file, [])) + list(in_adj.get(file, []))
+    seen = set(frontier)
+    for _ in range(max(0, hops - 1)):
+        new_frontier: List[str] = []
+        for cur in frontier:
+            for nxt in out_adj.get(cur, []) + in_adj.get(cur, []):
+                if nxt == file or nxt in seen:
+                    continue
+                seen.add(nxt)
+                push(nxt, 2, 55)
+                new_frontier.append(nxt)
+        frontier = new_frontier
+
+    if focal_syms:
+        for path, info in structure.items():
+            if path == file or path not in node_map:
+                continue
+            score = 0
+            calls = {name for name, _recv in (info.get("calls") or []) if name}
+            defs = {name for name, _kind, _recv in (info.get("funcs") or []) if name}
+            classes = set(info.get("classes") or [])
+            imports = set(info.get("imports") or [])
+
+            overlap = focal_syms & calls
+            if overlap:
+                score += min(60, 18 * len(overlap))
+            overlap = focal_syms & defs
+            if overlap:
+                score += min(50, 14 * len(overlap))
+            overlap = focal_syms & classes
+            if overlap:
+                score += min(50, 18 * len(overlap))
+
+            focal_stem = os.path.splitext(os.path.basename(file))[0]
+            if focal_stem and any(focal_stem in imp for imp in imports):
+                score += 24
+
+            if score > 0:
+                push(path, 2, score)
+
+    ranked = [(p, d, s) for p, (d, s) in scored.items()]
+    ranked.sort(key=lambda t: (t[1], -t[2], t[0]))
+    return ranked
+
+
 def _collect_files(index: dict, paths: List[str], max_chars_per_file: int, max_total_chars: Optional[int]) -> Tuple[List[dict], int, int]:
     node_map = _node_map(index)
     root = (index.get("meta") or {}).get("project_root", "")
@@ -490,6 +572,7 @@ def build_file_pack(
     page_size: int = 12,
     max_chars_per_file: int = 12000,
     max_total_chars: Optional[int] = None,
+    mode: str = "standard",
 ) -> dict:
     in_adj, out_adj = _normalize_adj(index)
     node_map = _node_map(index)
@@ -508,10 +591,20 @@ def build_file_pack(
         max_total_chars=max_total_chars,
     )
 
-    base_candidates: List[Tuple[str, int]] = []
+    best_dist: Dict[str, int] = {}
+    chain_scores: Dict[str, int] = {}
+
+    def push(path: str, dist: int, score: int = 0):
+        if path == file or path not in node_map:
+            return
+        if path not in best_dist or dist < best_dist[path]:
+            best_dist[path] = dist
+        if score > chain_scores.get(path, 0):
+            chain_scores[path] = score
+
     for f in ctx.get("files", []):
         dist = f.get("distance")
-        base_candidates.append((f["path"], 0 if dist is None else dist))
+        push(f["path"], 0 if dist is None else dist, 0)
 
     directory = os.path.dirname(file)
     kind = _kind_for_path(file, (node_map[file].get("lang") or "other"))
@@ -529,7 +622,11 @@ def build_file_pack(
         if path in in_adj.get(file, []):
             score += 16
         if score > 0:
-            base_candidates.append((path, 10 - min(9, score // 4)))
+            push(path, 10 - min(9, score // 4), score)
+
+    if mode == "full-chain":
+        for path, dist, score in _chain_candidates(index, file, hops=max(2, hops + 1)):
+            push(path, dist, score)
 
     bootstrap = build_bootstrap_pack(
         index=index,
@@ -540,19 +637,24 @@ def build_file_pack(
     )
     for item in bootstrap.get("selected_roots", []):
         if item["path"] != file:
-            base_candidates.append((item["path"], 2))
+            push(item["path"], 2, 40 if mode == "full-chain" else 0)
 
-    best_dist: Dict[str, int] = {}
-    for path, dist in base_candidates:
-        if path not in best_dist or dist < best_dist[path]:
-            best_dist[path] = dist
-
-    ordered = sorted(best_dist.items(), key=lambda kv: (kv[1], -int((node_map.get(kv[0]) or {}).get("size") or 0), kv[0]))
-    ordered_paths = [p for p, _ in ordered]
+    ordered = sorted(
+        best_dist.items(),
+        key=lambda kv: (
+            kv[1],
+            -(chain_scores.get(kv[0], 0)),
+            -int((node_map.get(kv[0]) or {}).get("size") or 0),
+            kv[0],
+        ),
+    )
+    ordered_paths = [file] + [p for p, _ in ordered if p != file]
     per_file_chars = max_chars_per_file
     if max_total_chars is not None and ordered_paths:
-        per_file_chars = min(max_chars_per_file, max(1500, max_total_chars // min(6, len(ordered_paths))))
+        divisor = 8 if mode == "full-chain" else 6
+        per_file_chars = min(max_chars_per_file, max(1500, max_total_chars // min(divisor, len(ordered_paths))))
     files, used, truncated = _collect_files(index, ordered_paths, per_file_chars, max_total_chars)
+    best_dist[file] = 0
     for f in files:
         if f["path"] in best_dist:
             f["distance"] = best_dist[f["path"]]
@@ -563,13 +665,15 @@ def build_file_pack(
             "distance": d,
             "kind": _kind_for_path(p, (node_map[p].get("lang") or "other")),
             "lang": node_map[p].get("lang"),
+            "chain_score": chain_scores.get(p, 0),
         }
-        for p, d in ordered[:12]
+        for p, d in ordered[:16]
     ]
 
     return {
         "file": file,
         "goal": goal,
+        "mode": mode,
         "project_profile": profile,
         "bootstrap_roots": bootstrap.get("selected_roots", [])[:4],
         "related_files": related,
