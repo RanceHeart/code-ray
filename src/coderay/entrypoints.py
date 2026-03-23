@@ -195,6 +195,70 @@ def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
                     score += 16
                     reasons.append("navigation-or-rexxar")
 
+        if lang == "swift":
+            if base in {"project.pbxproj", "package.swift", "podfile", "podfile.lock", "cartfile", "cartfile.resolved"}:
+                score += 42
+                reasons.append("ios-build-config")
+            if base.endswith("appdelegate.swift") or base.endswith("sceneDelegate.swift".lower()):
+                score += 56
+                reasons.append("ios-app-entry")
+            if base.endswith("ViewController.swift"):
+                score += 28
+                reasons.append("ios-view-controller")
+            if base.endswith("Coordinator.swift"):
+                score += 22
+                reasons.append("ios-coordinator")
+            if base.endswith("Manager.swift"):
+                score += 10
+                reasons.append("ios-manager")
+            if any(seg in parts for seg in ("source", "sources", "controller", "controllers", "router", "routing", "coordinator", "widget")):
+                score += 12
+                reasons.append("ios-structure-area")
+
+            text = _file_text(index, path) if (score > 0 or "/frodo/" in low_path or "/source/" in low_path) else ""
+            low_text = text.lower()
+            if "@main" in text or "uiapplicationmain" in low_text:
+                score += 34
+                reasons.append("ios-main-annotation")
+            if "class appdelegate" in low_text or ": uiresponder, uiapplicationdelegate" in low_text:
+                score += 36
+                reasons.append("app-delegate")
+            if "class scenedelegate" in low_text or "uiscenedelegate" in low_text:
+                score += 24
+                reasons.append("scene-delegate")
+            if "uiviewcontroller" in text or "UITabBarController" in text or "UINavigationController" in text:
+                score += 18
+                reasons.append("ui-entry-surface")
+            if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
+                score += 18
+                reasons.append("rexxar-or-routing")
+
+        if lang == "objective-c":
+            if base in {"project.pbxproj", "podfile", "podfile.lock"}:
+                score += 42
+                reasons.append("ios-build-config")
+            if base.endswith("appdelegate.m") or base.endswith("appdelegate.h") or base == "main.m":
+                score += 58
+                reasons.append("ios-app-entry")
+            if base.endswith("viewcontroller.m") or base.endswith("viewcontroller.h"):
+                score += 24
+                reasons.append("ios-view-controller")
+            if any(seg in parts for seg in ("controller", "controllers", "router", "routing", "coordinator", "utils")):
+                score += 10
+                reasons.append("ios-structure-area")
+
+            text = _file_text(index, path) if (score > 0 or "/frodo/" in low_path) else ""
+            low_text = text.lower()
+            if "uiapplicationmain" in low_text or "didfinishlaunchingwithoptions" in low_text:
+                score += 36
+                reasons.append("app-delegate")
+            if "uiviewcontroller" in low_text or "uitabbarcontroller" in low_text or "uinavigationcontroller" in low_text:
+                score += 18
+                reasons.append("ui-entry-surface")
+            if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
+                score += 18
+                reasons.append("rexxar-or-routing")
+
         if "/src/test/" in low_path or "/src/androidtest/" in low_path:
             score -= 40
             reasons.append("test-penalty")
@@ -204,6 +268,9 @@ def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
         if "proguard" in low_path:
             score -= 28
             reasons.append("build-noise-penalty")
+        if low_path.startswith("scripts/") or low_path.startswith("dsymtool/"):
+            score -= 28
+            reasons.append("tooling-penalty")
 
         in_degree = len(in_adj.get(path, []))
         out_degree = len(out_adj.get(path, []))
@@ -217,6 +284,8 @@ def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
                 reasons.append("python-hub")
         elif lang == "java" or low_path.endswith(".kt"):
             score += min(10, in_degree)
+        elif lang in {"swift", "objective-c"}:
+            score += min(8, in_degree)
 
         if score > 0:
             ranked.append(

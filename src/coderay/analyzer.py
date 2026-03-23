@@ -345,9 +345,11 @@ def build_index(project_root: str, files: List[FileInfo]) -> dict:
             # reliable than our AST import walker.
             parsed: ParsedFile = ts_parser.parse(src_abs, fi.lang)
             if parsed.func_defs or parsed.func_calls or parsed.classes or parsed.imports:
-                # Prefer regex-derived imports for Python to avoid malformed module names.
+                # Prefer regex-derived imports for Python/Swift to avoid malformed module names.
                 if fi.lang == "python":
                     import_refs = _parse_py_imports(_read_text(src_abs))
+                elif fi.lang == "swift":
+                    import_refs = _parse_swift_imports(_read_text(src_abs))
                 else:
                     import_refs = [imp.path for imp in parsed.imports]
 

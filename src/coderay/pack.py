@@ -28,6 +28,10 @@ ANDROID_HINTS = {
     "android", "activity", "fragment", "application", "manifest", "gradle", "app", "rexxar",
 }
 
+IOS_HINTS = {
+    "ios", "swift", "xcode", "appdelegate", "scenedelegate", "uikit", "viewcontroller", "podfile", "rexxar",
+}
+
 
 def _file_text(root: str, rel_path: str, limit: int = 120000) -> str:
     abs_path = os.path.join(root, rel_path)
@@ -48,6 +52,8 @@ def _tokenize_goal(goal: str) -> List[str]:
 
 def _goal_profile(goal: str) -> str:
     tokens = set(_tokenize_goal(goal))
+    if tokens & IOS_HINTS:
+        return "ios"
     if tokens & ANDROID_HINTS:
         return "android"
     if tokens & FRONTEND_HINTS:
@@ -115,13 +121,18 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
         is_proguard = "proguard" in low_path
         is_debug = "/debug/" in low_path
         is_android_java = lang == "java" or low_path.endswith(".kt")
+        is_ios_swift = lang == "swift"
+        is_ios_objc = lang == "objective-c"
+        is_ios_build = base in {"project.pbxproj", "package.swift", "podfile", "podfile.lock", "cartfile", "cartfile.resolved"}
+        is_ios_tooling = low_path.startswith("scripts/") or low_path.startswith("dsymtool/")
 
         should_read = (
             score > 0
-            or any(k in low_path for k in ("index", "app", "main", "service", "page", "route", "map", "widget", "component", "model", "view", "manifest", "gradle", "activity", "fragment"))
+            or any(k in low_path for k in ("index", "app", "main", "service", "page", "route", "map", "widget", "component", "model", "view", "manifest", "gradle", "activity", "fragment", "delegate", "podfile", "xcodeproj"))
             or (lang == "python" and base == "__init__.py")
             or is_android_manifest
             or is_gradle
+            or is_ios_build
         )
 
         text = ""
@@ -198,6 +209,66 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
                 why.append("navigation-or-rexxar")
             score += min(22, in_degree * 2)
             score += min(14, out_degree)
+        elif is_ios_swift:
+            if is_ios_build:
+                score += 34
+                why.append("ios-build-config")
+            if base.endswith("appdelegate.swift"):
+                score += 60
+                why.append("ios-app-entry")
+            if base.endswith("scenedelegate.swift"):
+                score += 42
+                why.append("ios-scene-entry")
+            if base.endswith("viewcontroller.swift"):
+                score += 26
+                why.append("ios-view-controller")
+            if base.endswith("coordinator.swift"):
+                score += 20
+                why.append("ios-coordinator")
+            if any(seg in parts for seg in ("source", "sources", "controller", "controllers", "router", "routing", "coordinator", "widget")):
+                score += 10
+                why.append("ios-structure-area")
+            if "@main" in low_text or "uiapplicationmain" in low_text:
+                score += 34
+                why.append("ios-main-annotation")
+            if "class appdelegate" in low_text or ": uiresponder, uiapplicationdelegate" in low_text:
+                score += 36
+                why.append("app-delegate")
+            if "class scenedelegate" in low_text or "uiscenedelegate" in low_text:
+                score += 24
+                why.append("scene-delegate")
+            if "uiviewcontroller" in low_text or "uitabbarcontroller" in low_text or "uinavigationcontroller" in low_text:
+                score += 16
+                why.append("ui-entry-surface")
+            if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
+                score += 18
+                why.append("rexxar-or-routing")
+            score += min(10, in_degree * 2)
+            score += min(8, out_degree)
+        elif is_ios_objc:
+            if is_ios_build:
+                score += 34
+                why.append("ios-build-config")
+            if base.endswith("appdelegate.m") or base.endswith("appdelegate.h") or base == "main.m":
+                score += 62
+                why.append("ios-app-entry")
+            if base.endswith("viewcontroller.m") or base.endswith("viewcontroller.h"):
+                score += 24
+                why.append("ios-view-controller")
+            if any(seg in parts for seg in ("controller", "controllers", "router", "routing", "coordinator", "utils")):
+                score += 10
+                why.append("ios-structure-area")
+            if "uiapplicationmain" in low_text or "didfinishlaunchingwithoptions" in low_text:
+                score += 36
+                why.append("app-delegate")
+            if "uiviewcontroller" in low_text or "uitabbarcontroller" in low_text or "uinavigationcontroller" in low_text:
+                score += 16
+                why.append("ui-entry-surface")
+            if "rexxar" in low_text or "urlroutes" in low_text or "rxr" in low_text:
+                score += 18
+                why.append("rexxar-or-routing")
+            score += min(8, in_degree * 2)
+            score += min(6, out_degree)
         else:
             score += min(10, in_degree)
             score += min(8, out_degree)
@@ -227,6 +298,12 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
                 why.append("goal-prefers-android")
             if lang == "python":
                 score -= 10
+        elif profile == "ios":
+            if is_ios_swift or is_ios_objc or is_ios_build:
+                score += 24
+                why.append("goal-prefers-ios")
+            if lang == "python":
+                score -= 14
         else:
             if lang == "python" and any(seg in {"model", "models", "view", "views", "service"} for seg in parts[:-1]):
                 score += 8
@@ -237,6 +314,9 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
             if is_android_java and (base.endswith("application.java") or base.endswith("activity.java") or base.endswith("fragment.java")):
                 score += 14
                 why.append("generic-android-bias")
+            if is_ios_build or is_ios_objc or base.endswith("appdelegate.swift") or base.endswith("scenedelegate.swift"):
+                score += 18
+                why.append("generic-ios-bias")
 
         if is_android_test:
             score -= 42
@@ -247,6 +327,9 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
         if is_proguard:
             score -= 30
             why.append("build-noise-penalty")
+        if is_ios_tooling:
+            score -= 28
+            why.append("tooling-penalty")
 
         if score > 0:
             scored.append(
