@@ -32,6 +32,23 @@ IOS_HINTS = {
     "ios", "swift", "xcode", "appdelegate", "scenedelegate", "uikit", "viewcontroller", "podfile", "rexxar",
 }
 
+STORAGE_HINTS = {
+    "storage", "store", "db", "database", "sql", "redis", "cache", "beansdb", "es", "index",
+    "persist", "persistence", "schema", "table", "tables", "mq",
+}
+
+FLOW_HINTS = {
+    "flow", "chain", "call", "trace", "path", "business", "logic", "feature",
+}
+
+UI_HINTS = {
+    "ui", "page", "screen", "view", "component", "template", "route",
+}
+
+CONFIG_HINTS = {
+    "config", "bootstrap", "entry", "startup", "init", "cron", "job", "task",
+}
+
 
 ARCH_FILES = {
     "package.json", "tsconfig.json", "pyproject.toml", "requirements.txt", "setup.py",
@@ -66,6 +83,19 @@ def _goal_profile(goal: str) -> str:
         return "frontend"
     if tokens & PYTHON_HINTS:
         return "backend"
+    return "generic"
+
+
+def _goal_task(goal: str) -> str:
+    tokens = set(_tokenize_goal(goal))
+    if tokens & STORAGE_HINTS:
+        return "storage"
+    if tokens & UI_HINTS:
+        return "ui"
+    if tokens & CONFIG_HINTS:
+        return "config"
+    if tokens & FLOW_HINTS:
+        return "flow"
     return "generic"
 
 
@@ -155,6 +185,49 @@ def _kind_for_path(path: str, lang: str) -> str:
     return "other"
 
 
+def _describe_path(index: dict, path: str, goal: Optional[str] = None) -> Tuple[str, List[str]]:
+    node_map = _node_map(index)
+    lang = (node_map.get(path) or {}).get("lang") or "other"
+    role = _kind_for_path(path, lang)
+    reasons: List[str] = []
+    low = path.lower()
+    base = os.path.basename(low)
+    text = _file_text((index.get("meta") or {}).get("project_root", ""), path, limit=6000).lower()
+    task = _goal_task(goal or "")
+
+    if role == "config":
+        reasons.append("project config or manifest")
+    elif role == "entry":
+        reasons.append("likely lifecycle or startup entry")
+    elif role == "router":
+        reasons.append("routing/navigation surface")
+    elif role == "surface":
+        reasons.append("user-facing surface/controller")
+    elif role == "logic":
+        reasons.append("service/logic layer")
+    elif role == "domain":
+        reasons.append("domain/model layer")
+
+    if "store.execute" in text or "insert into" in text or "update " in text or "select " in text:
+        reasons.append("touches SQL storage")
+    if "redis." in text or "get_frodo_rdstore" in text:
+        reasons.append("touches redis")
+    if "db.set(" in text or "db.get(" in text or "beansdb" in text:
+        reasons.append("touches kv storage")
+    if "asynchronous" in text or "/cron/" in low:
+        reasons.append("async/cron path")
+    if task == "storage" and any(x in text for x in ["store.execute", "db.set(", "db.get(", "redis.", "search", "mq"]):
+        reasons.append("matches storage task")
+    if task == "flow" and role in {"entry", "router", "surface", "logic"}:
+        reasons.append("matches flow task")
+    if task == "ui" and role in {"surface", "router"}:
+        reasons.append("matches ui task")
+    if task == "config" and role in {"config", "entry"}:
+        reasons.append("matches config task")
+
+    return role, reasons[:4]
+
+
 def _detect_project_profile(index: dict) -> dict:
     nodes = index.get("nodes") or []
     langs: Dict[str, int] = {}
@@ -191,6 +264,7 @@ def _score_candidate(index: dict, path: str, lang: str, in_adj: Dict[str, List[s
     base = os.path.basename(low_path)
     parts = _path_parts(path)
     profile = _goal_profile(goal)
+    task = _goal_task(goal)
     words = _tokenize_goal(goal)
     in_degree = len(in_adj.get(path, []))
     out_degree = len(out_adj.get(path, []))
@@ -215,6 +289,33 @@ def _score_candidate(index: dict, path: str, lang: str, in_adj: Dict[str, List[s
         if hits:
             score += min(24, hits * 3)
             why.append(f"content-match:{w}x{hits}")
+
+    if task == "storage":
+        has_sql = any(tok in low_text for tok in ["store.execute", "insert into", "select ", "update ", "delete from"])
+        has_redis = any(tok in low_text for tok in ["redis.", "get_frodo_rdstore"])
+        has_kv = any(tok in low_text for tok in ["db.set(", "db.get(", "beansdb"])
+        has_search = any(tok in low_text for tok in ["search", "scan", "index"])
+        if has_sql:
+            score += 48
+            why.append("storage-sql")
+        if has_redis:
+            score += 28
+            why.append("storage-redis")
+        if has_kv:
+            score += 28
+            why.append("storage-kv")
+        if has_search:
+            score += 16
+            why.append("storage-search")
+        if "/cron/" in low_path or "asynchronous" in low_text:
+            score += 18
+            why.append("storage-recompute-path")
+        if kind in {"config", "domain", "logic"}:
+            score += 22
+            why.append("storage-layer-bias")
+        if kind == "surface" and not (has_sql or has_redis or has_kv):
+            score -= 18
+            why.append("storage-surface-penalty")
 
     if lang == "python":
         if base in {"main.py", "app.py", "manage.py", "wsgi.py", "asgi.py", "__main__.py"}:
@@ -340,15 +441,18 @@ def _score_candidate(index: dict, path: str, lang: str, in_adj: Dict[str, List[s
         score -= 30
         why.append("build-noise-penalty")
     if "/example/" in low_path or "/examples/" in low_path or "/demo/" in low_path:
-        score -= 14
+        score -= 24
         why.append("example-penalty")
 
+    role, readable_reasons = _describe_path(index, path, goal)
     return {
         "path": path,
         "lang": lang,
         "score": score,
         "why": why[:8],
+        "reasons": readable_reasons,
         "kind": kind,
+        "role": role,
         "target": _target_key(path),
         "in_degree": in_degree,
         "out_degree": out_degree,
@@ -561,10 +665,13 @@ def _layered_file_relations(
     for path, dist in ordered:
         if path == file or path not in node_map or path in used:
             continue
+        role, reasons = _describe_path(index, path)
         item = {
             "path": path,
             "distance": dist,
             "kind": _kind_for_path(path, (node_map[path].get("lang") or "other")),
+            "role": role,
+            "reasons": reasons,
             "lang": node_map[path].get("lang"),
             "chain_score": chain_scores.get(path, 0),
         }
@@ -580,10 +687,13 @@ def _layered_file_relations(
     for path, dist in ordered:
         if path == file or path not in node_map or path in used:
             continue
+        role, reasons = _describe_path(index, path)
         item = {
             "path": path,
             "distance": dist,
             "kind": _kind_for_path(path, (node_map[path].get("lang") or "other")),
+            "role": role,
+            "reasons": reasons,
             "lang": node_map[path].get("lang"),
             "chain_score": chain_scores.get(path, 0),
         }
@@ -604,11 +714,14 @@ def _layered_file_relations(
             used.add(path)
             continue
 
+    focal_role, focal_reasons = _describe_path(index, file)
     return {
         "focal": [{
             "path": file,
             "distance": 0,
             "kind": _kind_for_path(file, (node_map[file].get("lang") or "other")),
+            "role": focal_role,
+            "reasons": focal_reasons,
             "lang": node_map[file].get("lang"),
             "chain_score": 0,
         }],
@@ -618,6 +731,28 @@ def _layered_file_relations(
         "entry_chain": entry_chain[:8],
         "siblings": siblings[:8],
     }
+
+
+def _materialize_layer_budget(file: str, layers: dict, mode: str) -> List[str]:
+    ordered: List[str] = [file]
+    quotas = {
+        "direct_deps": 3,
+        "reverse_deps": 2,
+        "symbol_related": 2 if mode == "full-chain" else 1,
+        "entry_chain": 2,
+        "siblings": 3,
+    }
+    for layer, quota in quotas.items():
+        for item in (layers.get(layer) or [])[:quota]:
+            path = item.get("path")
+            if path and path not in ordered:
+                ordered.append(path)
+    for layer in ["direct_deps", "reverse_deps", "symbol_related", "entry_chain", "siblings"]:
+        for item in layers.get(layer) or []:
+            path = item.get("path")
+            if path and path not in ordered:
+                ordered.append(path)
+    return ordered
 
 
 def build_bootstrap_pack(
@@ -732,7 +867,8 @@ def build_file_pack(
             kv[0],
         ),
     )
-    ordered_paths = [file] + [p for p, _ in ordered if p != file]
+    layers = _layered_file_relations(index, file, ordered, bootstrap.get("selected_roots", [])[:4], chain_scores)
+    ordered_paths = _materialize_layer_budget(file, layers, mode)
     per_file_chars = max_chars_per_file
     if max_total_chars is not None and ordered_paths:
         divisor = 8 if mode == "full-chain" else 6
@@ -743,17 +879,20 @@ def build_file_pack(
         if f["path"] in best_dist:
             f["distance"] = best_dist[f["path"]]
 
-    related = [
-        {
-            "path": p,
-            "distance": d,
-            "kind": _kind_for_path(p, (node_map[p].get("lang") or "other")),
-            "lang": node_map[p].get("lang"),
-            "chain_score": chain_scores.get(p, 0),
-        }
-        for p, d in ordered[:16]
-    ]
-    layers = _layered_file_relations(index, file, ordered, bootstrap.get("selected_roots", [])[:4], chain_scores)
+    related = []
+    for p, d in ordered[:16]:
+        role, reasons = _describe_path(index, p, goal)
+        related.append(
+            {
+                "path": p,
+                "distance": d,
+                "kind": _kind_for_path(p, (node_map[p].get("lang") or "other")),
+                "role": role,
+                "reasons": reasons,
+                "lang": node_map[p].get("lang"),
+                "chain_score": chain_scores.get(p, 0),
+            }
+        )
 
     return {
         "file": file,
