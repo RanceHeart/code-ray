@@ -24,6 +24,10 @@ FRONTEND_HINTS = {
     "frontend", "ui", "react", "tsx", "typescript", "javascript", "component", "components", "page",
 }
 
+ANDROID_HINTS = {
+    "android", "activity", "fragment", "application", "manifest", "gradle", "app", "rexxar",
+}
+
 
 def _file_text(root: str, rel_path: str, limit: int = 120000) -> str:
     abs_path = os.path.join(root, rel_path)
@@ -44,6 +48,8 @@ def _tokenize_goal(goal: str) -> List[str]:
 
 def _goal_profile(goal: str) -> str:
     tokens = set(_tokenize_goal(goal))
+    if tokens & ANDROID_HINTS:
+        return "android"
     if tokens & FRONTEND_HINTS:
         return "frontend"
     if tokens & PYTHON_SERVICE_HINTS:
@@ -102,18 +108,33 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
                 score += 18
                 why.append(f"path-match:{w}")
 
+        is_android_manifest = low_path.endswith("androidmanifest.xml")
+        is_gradle = base in {"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties"}
+        is_android_main = "/src/main/" in low_path
+        is_android_test = "/src/test/" in low_path or "/src/androidtest/" in low_path
+        is_proguard = "proguard" in low_path
+        is_debug = "/debug/" in low_path
+        is_android_java = lang == "java" or low_path.endswith(".kt")
+
         should_read = (
             score > 0
-            or any(k in low_path for k in ("index", "app", "main", "service", "page", "route", "map", "widget", "component", "model", "view"))
+            or any(k in low_path for k in ("index", "app", "main", "service", "page", "route", "map", "widget", "component", "model", "view", "manifest", "gradle", "activity", "fragment"))
             or (lang == "python" and base == "__init__.py")
+            or is_android_manifest
+            or is_gradle
         )
+
+        text = ""
         if should_read:
-            text = _file_text(root, path, limit=30000).lower()
+            text = _file_text(root, path, limit=30000)
+            low_text = text.lower()
             for w in words[:8]:
-                hits = text.count(w)
+                hits = low_text.count(w)
                 if hits:
                     score += min(24, hits * 3)
                     why.append(f"content-match:{w}x{hits}")
+        else:
+            low_text = ""
 
         if path.endswith("map.json"):
             score += 16
@@ -147,9 +168,46 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
                 why.append("index-file")
             score += min(16, in_degree * 2)
             score += min(12, out_degree)
+        elif is_android_java:
+            if is_android_main:
+                score += 12
+                why.append("android-main-src")
+            if base.endswith("application.java") or base.endswith("application.kt"):
+                score += 50
+                why.append("application-class")
+            if base.endswith("activity.java") or base.endswith("activity.kt"):
+                score += 32
+                why.append("activity-class")
+            if base.endswith("fragment.java") or base.endswith("fragment.kt"):
+                score += 22
+                why.append("fragment-class")
+            if "/api/" in low_path:
+                score += 4
+                why.append("api-layer")
+            if " extends application" in low_text or "extends multidexapplication" in low_text:
+                score += 44
+                why.append("extends-application")
+            if " extends activity" in low_text or " extends appcompatactivity" in low_text or " extends baseactivity" in low_text:
+                score += 24
+                why.append("extends-activity")
+            if " extends fragment" in low_text or " extends dialogfragment" in low_text:
+                score += 18
+                why.append("extends-fragment")
+            if "rexxar" in low_text or "routemanager" in low_text or "uridispatcher" in low_text:
+                score += 18
+                why.append("navigation-or-rexxar")
+            score += min(22, in_degree * 2)
+            score += min(14, out_degree)
         else:
             score += min(10, in_degree)
             score += min(8, out_degree)
+
+        if is_android_manifest:
+            score += 90
+            why.append("android-manifest")
+        if is_gradle:
+            score += 30
+            why.append("build-config")
 
         if profile == "backend":
             if lang == "python":
@@ -163,10 +221,32 @@ def _score_files(index: dict, goal: str, limit: int = 25) -> List[dict]:
                 why.append("goal-prefers-frontend")
             elif lang == "python":
                 score -= 8
+        elif profile == "android":
+            if is_android_manifest or is_gradle or is_android_java:
+                score += 22
+                why.append("goal-prefers-android")
+            if lang == "python":
+                score -= 10
         else:
             if lang == "python" and any(seg in {"model", "models", "view", "views", "service"} for seg in parts[:-1]):
                 score += 8
                 why.append("generic-python-bias")
+            if is_android_manifest or (is_gradle and "/app/" in low_path):
+                score += 18
+                why.append("generic-architecture-bias")
+            if is_android_java and (base.endswith("application.java") or base.endswith("activity.java") or base.endswith("fragment.java")):
+                score += 14
+                why.append("generic-android-bias")
+
+        if is_android_test:
+            score -= 42
+            why.append("test-penalty")
+        if is_debug:
+            score -= 16
+            why.append("debug-penalty")
+        if is_proguard:
+            score -= 30
+            why.append("build-noise-penalty")
 
         if score > 0:
             scored.append(

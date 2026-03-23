@@ -83,6 +83,16 @@ def _normalize_adj(index: dict) -> Tuple[Dict[str, List[str]], Dict[str, List[st
     return convert(raw_in), convert(raw_out)
 
 
+def _file_text(index: dict, rel_path: str, limit: int = 12000) -> str:
+    root = (index.get("meta") or {}).get("project_root", "")
+    abs_path = os.path.join(root, rel_path)
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return ""
+
+
 def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
     nodes = index.get("nodes") or []
     in_adj, out_adj = _normalize_adj(index)
@@ -106,6 +116,12 @@ def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
         if path == "tsconfig.json":
             score += 25
             reasons.append("tsconfig")
+        if low_path.endswith("androidmanifest.xml"):
+            score += 90
+            reasons.append("android-manifest")
+        if base in {"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties"}:
+            score += 36
+            reasons.append("build-config")
         if base in ENTRY_BASENAMES:
             score += 40
             reasons.append(f"entry-basename:{base}")
@@ -143,6 +159,52 @@ def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
                 score += 6
                 reasons.append("python-shallow")
 
+        is_android_src = "/src/main/java/" in low_path or "/src/main/kotlin/" in low_path
+        if lang == "java" or low_path.endswith(".kt"):
+            if is_android_src:
+                score += 8
+                reasons.append("android-main-src")
+            if any(seg in parts for seg in ("activity", "fragment", "application", "service", "receiver", "provider")):
+                score += 18
+                reasons.append("android-component-area")
+            if "/api/" in low_path:
+                score += 6
+                reasons.append("api-layer")
+            if low_path.endswith("application.java") or low_path.endswith("application.kt"):
+                score += 48
+                reasons.append("application-class")
+            if base.endswith("Activity.java") or base.endswith("Activity.kt"):
+                score += 34
+                reasons.append("activity-class")
+            if base.endswith("Fragment.java") or base.endswith("Fragment.kt"):
+                score += 26
+                reasons.append("fragment-class")
+
+            if score > 0 or is_android_src:
+                text = _file_text(index, path)
+                if " extends Application" in text or "extends MultiDexApplication" in text:
+                    score += 40
+                    reasons.append("extends-application")
+                if " extends Activity" in text or " extends AppCompatActivity" in text or " extends BaseActivity" in text:
+                    score += 26
+                    reasons.append("extends-activity")
+                if " extends Fragment" in text or " extends DialogFragment" in text:
+                    score += 20
+                    reasons.append("extends-fragment")
+                if "RouteManager" in text or "UriDispatcher" in text or "rexxar" in text.lower():
+                    score += 16
+                    reasons.append("navigation-or-rexxar")
+
+        if "/src/test/" in low_path or "/src/androidtest/" in low_path:
+            score -= 40
+            reasons.append("test-penalty")
+        if "/debug/" in low_path:
+            score -= 16
+            reasons.append("debug-penalty")
+        if "proguard" in low_path:
+            score -= 28
+            reasons.append("build-noise-penalty")
+
         in_degree = len(in_adj.get(path, []))
         out_degree = len(out_adj.get(path, []))
         score += min(24, in_degree * 2)
@@ -153,6 +215,8 @@ def detect_entrypoints(index: dict, top_n: int = 50) -> dict:
             if base == "__init__.py" and in_degree >= 8:
                 score += 10
                 reasons.append("python-hub")
+        elif lang == "java" or low_path.endswith(".kt"):
+            score += min(10, in_degree)
 
         if score > 0:
             ranked.append(
